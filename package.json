@@ -1,7 +1,7 @@
 {
-  "name": "chronacare:-ai-pill-reminder",
+  "name": "chronacare-ai-pill-reminder",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,9 +9,10 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "react": "^19.2.0",
-    "@google/genai": "^1.28.0",
-    "react-dom": "^19.2.0"
+    "@google/genai": "^1.26.0",
+    "@supabase/supabase-js": "^2.49.4",
+    "react-dom": "^19.2.0",
+    "react": "^19.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
