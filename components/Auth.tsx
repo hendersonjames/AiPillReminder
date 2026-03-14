@@ -1,6 +1,7 @@
 // components/Auth.tsx
 import React, { useState } from 'react';
 import { signIn, signUp, signInWithGoogle } from '../services/authService';
+import { supabaseConfigured } from '../lib/supabase';
 
 const Auth: React.FC = () => {
   const [isSignUp, setIsSignUp] = useState(false);
@@ -9,6 +10,24 @@ const Auth: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+
+  // Config error screen — shown if Supabase env vars are missing
+  if (!supabaseConfigured) {
+    return (
+      <div className="min-h-screen bg-sky-50 flex items-center justify-center p-4">
+        <div className="w-full max-w-md bg-white rounded-2xl p-8 border border-red-200 shadow-xl">
+          <h1 className="text-2xl font-bold text-red-600 mb-2">⚠️ Configuration Required</h1>
+          <p className="text-slate-600 text-sm mb-4">The following environment variables are missing from your Vercel deployment:</p>
+          <ul className="bg-red-50 rounded-lg p-4 text-sm font-mono text-red-700 space-y-1 mb-4">
+            <li>VITE_SUPABASE_URL</li>
+            <li>VITE_SUPABASE_PUBLISHABLE_KEY</li>
+            <li>GEMINI_API_KEY</li>
+          </ul>
+          <p className="text-slate-500 text-xs">Add these in your Vercel project → Settings → Environment Variables, then redeploy.</p>
+        </div>
+      </div>
+    );
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
