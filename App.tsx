@@ -10,13 +10,121 @@ import { playSound } from './services/soundService';
 import { onAuthStateChange, signOut, type User } from './services/authService';
 import { loadPillsFromCloud, syncPillsToCloud } from './services/pillsService';
 
-const SYNC_DEBOUNCE_MS = 2000; // wait 2s after last change before syncing
+const SYNC_DEBOUNCE_MS = 2000;
+
+// ─── Browser Notification helpers ────────────────────────────────────────────
+
+const requestNotificationPermission = async () => {
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'default') {
+    await Notification.requestPermission();
+  }
+};
+
+const showNotification = (title: string, body: string) => {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  try {
+    new Notification(title, {
+      body,
+      icon: '/favicon.ico',
+      badge: '/favicon.ico',
+      tag: title, // prevents duplicate stacking
+      renotify: true,
+    });
+  } catch (err) {
+    console.warn('Notification failed:', err);
+  }
+};
+
+// ─── Missed dose logging ──────────────────────────────────────────────────────
+// Key: stores the last date we ran the end-of-day missed-dose sweep
+const MISSED_DOSE_SWEEP_KEY = 'remedi_last_missed_sweep';
+
+const getTodayDateString = () => new Date().toDateString();
+const getYesterdayDateString = () => {
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  return d.toDateString();
+};
+
+/**
+ * At end of day, any reminder that was scheduled today but not marked taken
+ * (and not currently snoozed) is recorded as 'missed' in history.
+ * We run this check once per day when the app is open, covering yesterday.
+ */
+const recordMissedDoses = (pills: Pill[], setPills: React.Dispatch<React.SetStateAction<Pill[]>>) => {
+  const lastSweep = localStorage.getItem(MISSED_DOSE_SWEEP_KEY);
+  const yesterday = getYesterdayDateString();
+  if (lastSweep === yesterday) return; // already ran for yesterday
+
+  const yesterdayDate = new Date();
+  yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+  const yesterdayDay = yesterdayDate.getDay();
+
+  const now = Date.now();
+  let anyChanges = false;
+
+  const updatedPills = pills.map(pill => {
+    const newHistory = [...(pill.history || [])];
+    pill.reminders.forEach(reminder => {
+      if (!reminder.daysOfWeek.includes(yesterdayDay)) return; // not scheduled yesterday
+      if (reminder.taken) return; // taken today resets at midnight — handled separately
+
+      // Check if there's already a 'taken' or 'missed' entry for yesterday
+      const yesterdayStart = new Date(yesterdayDate);
+      yesterdayStart.setHours(0, 0, 0, 0);
+      const yesterdayEnd = new Date(yesterdayDate);
+      yesterdayEnd.setHours(23, 59, 59, 999);
+
+      const alreadyLogged = newHistory.some(h =>
+        h.reminderId === reminder.id &&
+        h.timestamp >= yesterdayStart.getTime() &&
+        h.timestamp <= yesterdayEnd.getTime() &&
+        (h.action === 'taken' || h.action === 'missed')
+      );
+
+      if (!alreadyLogged) {
+        newHistory.push({
+          id: `missed-${Date.now()}-${reminder.id}`,
+          reminderId: reminder.id,
+          pillName: pill.name,
+          time: reminder.time,
+          action: 'missed',
+          timestamp: yesterdayEnd.getTime(),
+        });
+        anyChanges = true;
+      }
+    });
+    return anyChanges ? { ...pill, history: newHistory } : pill;
+  });
+
+  if (anyChanges) {
+    setPills(updatedPills);
+  }
+  localStorage.setItem(MISSED_DOSE_SWEEP_KEY, yesterday);
+};
+
+// ─── Reset taken status at midnight ──────────────────────────────────────────
+const resetTakenAtMidnight = (setPills: React.Dispatch<React.SetStateAction<Pill[]>>) => {
+  setPills(prev => prev.map(pill => ({
+    ...pill,
+    reminders: pill.reminders.map(r => ({
+      ...r,
+      taken: false,
+      snoozedUntil: undefined,
+    })),
+  })));
+};
+
+// ─── App ──────────────────────────────────────────────────────────────────────
 
 const App: React.FC = () => {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
+  const [notifDismissed, setNotifDismissed] = useState(false);
   const syncTimeoutRef = useRef<number | undefined>(undefined);
+  const pillsRef = useRef<Pill[]>([]);
 
   const [pills, setPills] = useState<Pill[]>(() => {
     try {
@@ -28,20 +136,24 @@ const App: React.FC = () => {
     return [];
   });
 
+  // Keep ref in sync for use inside intervals/callbacks
+  useEffect(() => { pillsRef.current = pills; }, [pills]);
+
   const [isAddPillModalOpen, setAddPillModalOpen] = useState(false);
   const [isChatModalOpen, setChatModalOpen] = useState(false);
   const [pillToEdit, setPillToEdit] = useState<Pill | undefined>(undefined);
 
-  // Auth state listener
+  // ── Auth listener ──
   useEffect(() => {
     const { data: { subscription } } = onAuthStateChange((currentUser) => {
       setUser(currentUser);
       setAuthLoading(false);
+      if (currentUser) requestNotificationPermission();
     });
     return () => subscription.unsubscribe();
   }, []);
 
-  // Load pills from cloud when user logs in
+  // ── Load from cloud on login ──
   useEffect(() => {
     if (!user) return;
     const loadCloud = async () => {
@@ -61,7 +173,7 @@ const App: React.FC = () => {
     loadCloud();
   }, [user]);
 
-  // Sync pills to localStorage whenever they change
+  // ── Persist to localStorage ──
   useEffect(() => {
     try {
       localStorage.setItem('pills', JSON.stringify(pills));
@@ -70,7 +182,7 @@ const App: React.FC = () => {
     }
   }, [pills]);
 
-  // Debounced cloud sync when pills change (only if logged in)
+  // ── Debounced cloud sync ──
   useEffect(() => {
     if (!user) return;
     if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
@@ -88,15 +200,22 @@ const App: React.FC = () => {
     return () => { if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current); };
   }, [pills, user]);
 
-  // Check for expired snoozes periodically
+  // ── Snooze expiry check (every 30s) — re-triggers alarm when snooze ends ──
   useEffect(() => {
     const interval = setInterval(() => {
-      let hasChanges = false;
       const now = Date.now();
-      const updatedPills = pills.map(pill => {
+      let hasChanges = false;
+      const reAlarmPills: { pillName: string; pillSound?: string; reminderTime: string }[] = [];
+
+      const updatedPills = pillsRef.current.map(pill => {
         const newReminders = pill.reminders.map(reminder => {
           if (reminder.snoozedUntil && reminder.snoozedUntil <= now) {
             hasChanges = true;
+            reAlarmPills.push({
+              pillName: pill.name,
+              pillSound: pill.notificationSound,
+              reminderTime: reminder.time,
+            });
             const { snoozedUntil, ...rest } = reminder;
             return rest;
           }
@@ -104,36 +223,84 @@ const App: React.FC = () => {
         });
         return { ...pill, reminders: newReminders };
       });
-      if (hasChanges) setPills(updatedPills);
+
+      if (hasChanges) {
+        setPills(updatedPills);
+        // Re-alarm for each expired snooze
+        reAlarmPills.forEach(({ pillName, pillSound, reminderTime }) => {
+          playSound(pillSound);
+          showNotification(
+            `⏰ ${pillName}`,
+            `Your snoozed reminder for ${reminderTime} is due!`
+          );
+        });
+      }
     }, 1000 * 30);
     return () => clearInterval(interval);
-  }, [pills]);
+  }, []);
 
-  // Check for due reminders
+  // ── Midnight reset + missed dose sweep ──
+  useEffect(() => {
+    if (!user) return;
+    // Run missed dose sweep on load (covers yesterday)
+    recordMissedDoses(pillsRef.current, setPills);
+
+    // Schedule midnight reset
+    const now = new Date();
+    const midnight = new Date(now);
+    midnight.setHours(24, 0, 5, 0); // 5 seconds past midnight
+    const msUntilMidnight = midnight.getTime() - now.getTime();
+
+    const midnightTimeout = setTimeout(() => {
+      recordMissedDoses(pillsRef.current, setPills);
+      resetTakenAtMidnight(setPills);
+    }, msUntilMidnight);
+
+    return () => clearTimeout(midnightTimeout);
+  }, [user]);
+
+  // ── Due reminder check (fires at each minute boundary) ──
   useEffect(() => {
     let intervalId: number | undefined;
+
     const checkReminders = () => {
       const now = new Date();
       const currentTime = now.toTimeString().substring(0, 5);
       const currentDay = now.getDay();
-      pills.forEach(pill => {
+
+      pillsRef.current.forEach(pill => {
         pill.reminders.forEach(reminder => {
           const isDue = reminder.time === currentTime;
           const isToday = reminder.daysOfWeek.includes(currentDay);
           const isSnoozed = reminder.snoozedUntil && reminder.snoozedUntil > now.getTime();
+
           if (isDue && isToday && !reminder.taken && !isSnoozed) {
             playSound(pill.notificationSound);
+            showNotification(
+              `💊 Time for ${pill.name}`,
+              pill.dosage
+                ? `${pill.dosage} — tap to open Remedi`
+                : 'Tap to open Remedi and mark as taken'
+            );
           }
         });
       });
     };
+
+    // Sync to next minute boundary, then fire every 60s
     const secondsUntilNextMinute = 60 - new Date().getSeconds();
     const timeoutId = setTimeout(() => {
       checkReminders();
       intervalId = window.setInterval(checkReminders, 60 * 1000);
     }, secondsUntilNextMinute * 1000);
-    return () => { clearTimeout(timeoutId); if (intervalId) clearInterval(intervalId); };
-  }, [pills]);
+
+    return () => {
+      clearTimeout(timeoutId);
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, []); // runs once — uses pillsRef so always sees latest pills
+
+  // ─── Handlers ───────────────────────────────────────────────────────────────
 
   const savePill = (pillData: Omit<Pill, 'id' | 'history'> | Pill) => {
     if ('id' in pillData && pillData.id) {
@@ -158,7 +325,14 @@ const App: React.FC = () => {
           if (reminder.id === reminderId) {
             const willBeTaken = !reminder.taken;
             if (willBeTaken) {
-              newHistoryEntry = { id: `${Date.now()}-${reminderId}`, reminderId: reminder.id, pillName: pill.name, time: reminder.time, action: 'taken', timestamp: Date.now() };
+              newHistoryEntry = {
+                id: `${Date.now()}-${reminderId}`,
+                reminderId: reminder.id,
+                pillName: pill.name,
+                time: reminder.time,
+                action: 'taken',
+                timestamp: Date.now(),
+              };
             }
             const newReminder = { ...reminder, taken: willBeTaken };
             if (newReminder.taken) delete newReminder.snoozedUntil;
@@ -179,7 +353,14 @@ const App: React.FC = () => {
         let newHistoryEntry: HistoryEntry | undefined;
         const updatedReminders = pill.reminders.map(reminder => {
           if (reminder.id === reminderId) {
-            newHistoryEntry = { id: `${Date.now()}-${reminderId}`, reminderId: reminder.id, pillName: pill.name, time: reminder.time, action: 'snoozed', timestamp: Date.now() };
+            newHistoryEntry = {
+              id: `${Date.now()}-${reminderId}`,
+              reminderId: reminder.id,
+              pillName: pill.name,
+              time: reminder.time,
+              action: 'snoozed',
+              timestamp: Date.now(),
+            };
             return { ...reminder, snoozedUntil: Date.now() + duration, taken: false };
           }
           return reminder;
@@ -195,6 +376,8 @@ const App: React.FC = () => {
     setPills(prevPills => prevPills.filter(pill => pill.id !== pillId));
   }, []);
 
+  // ─── Render ──────────────────────────────────────────────────────────────────
+
   if (authLoading) {
     return (
       <div className="min-h-screen bg-sky-100 flex items-center justify-center">
@@ -205,9 +388,30 @@ const App: React.FC = () => {
 
   if (!user) return <Auth />;
 
+  const showNotifBanner =
+    !notifDismissed &&
+    'Notification' in window &&
+    Notification.permission === 'denied';
+
   return (
     <div className="min-h-screen bg-sky-100 font-sans text-slate-800">
       <div className="container mx-auto max-w-2xl p-4 pb-28">
+        {/* Notification permission denied banner */}
+        {showNotifBanner && (
+          <div className="mb-3 p-3 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-800 flex items-start justify-between gap-2">
+            <span>🔔 Notifications are blocked. Enable them in your browser settings to receive reminders.</span>
+            <button onClick={() => setNotifDismissed(true)} className="text-amber-400 hover:text-amber-600 flex-shrink-0">✕</button>
+          </div>
+        )}
+
+        {/* Tab-open reminder banner (web limitation, shown once) */}
+        {!notifDismissed && !showNotifBanner && 'Notification' in window && Notification.permission === 'default' && (
+          <div className="mb-3 p-3 bg-sky-50 border border-sky-200 rounded-xl text-sm text-sky-800 flex items-start justify-between gap-2">
+            <span>💡 Keep this tab open for reminders. Download the app for alarms that work even when your phone is locked.</span>
+            <button onClick={() => setNotifDismissed(true)} className="text-sky-400 hover:text-sky-600 flex-shrink-0">✕</button>
+          </div>
+        )}
+
         <div className="flex justify-between items-center pt-2 pb-1">
           <Header />
           <div className="flex items-center gap-2">
@@ -217,6 +421,7 @@ const App: React.FC = () => {
             <button onClick={signOut} className="text-xs text-slate-400 hover:text-slate-600">Sign out</button>
           </div>
         </div>
+
         <main>
           <PillList
             pills={pills}
@@ -237,12 +442,16 @@ const App: React.FC = () => {
 
       <div className="fixed bottom-0 left-0 right-0 h-24 bg-gradient-to-t from-sky-100 to-transparent pointer-events-none z-30"></div>
       <div className="fixed bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-4 z-40">
-        <button onClick={() => setChatModalOpen(true)}
-          className="bg-sky-500 text-white font-semibold rounded-full px-6 py-3 shadow-lg hover:bg-sky-600 transition-transform hover:scale-105 flex items-center gap-2">
+        <button
+          onClick={() => setChatModalOpen(true)}
+          className="bg-sky-500 text-white font-semibold rounded-full px-6 py-3 shadow-lg hover:bg-sky-600 transition-transform hover:scale-105 flex items-center gap-2"
+        >
           <ChatIcon className="w-6 h-6" /><span>AI Chat</span>
         </button>
-        <button onClick={openAddModal}
-          className="bg-red-500 text-white font-semibold rounded-full px-6 py-3 shadow-lg hover:bg-red-600 transition-transform hover:scale-105 flex items-center gap-2">
+        <button
+          onClick={openAddModal}
+          className="bg-red-500 text-white font-semibold rounded-full px-6 py-3 shadow-lg hover:bg-red-600 transition-transform hover:scale-105 flex items-center gap-2"
+        >
           <PlusIcon className="w-6 h-6" /><span>Add Pill</span>
         </button>
       </div>

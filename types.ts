@@ -11,7 +11,7 @@ export interface HistoryEntry {
   reminderId: string;
   pillName: string;
   time: string; // The time of the reminder, e.g., "09:00"
-  action: 'taken' | 'snoozed';
+  action: 'taken' | 'snoozed' | 'missed';
   timestamp: number; // The exact time the action occurred
 }
 
