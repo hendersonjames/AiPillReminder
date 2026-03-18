@@ -2,6 +2,8 @@
 import React, { useState } from 'react';
 import { signIn, signUp, signInWithGoogle } from '../services/authService';
 import { supabaseConfigured } from '../lib/supabase';
+import PrivacyPolicy from './PrivacyPolicy';
+import TermsOfService from './TermsOfService';
 
 const Auth: React.FC = () => {
   const [isSignUp, setIsSignUp] = useState(false);
@@ -10,6 +12,11 @@ const Auth: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [showPrivacy, setShowPrivacy] = useState(false);
+  const [showTerms, setShowTerms] = useState(false);
+
+  if (showPrivacy) return <PrivacyPolicy onClose={() => setShowPrivacy(false)} />;
+  if (showTerms) return <TermsOfService onClose={() => setShowTerms(false)} />;
 
   // Config error screen — shown if Supabase env vars are missing
   if (!supabaseConfigured) {
@@ -116,6 +123,22 @@ const Auth: React.FC = () => {
               {isSignUp ? 'Sign in' : 'Sign up free'}
             </button>
           </p>
+
+          {isSignUp && (
+            <p className="text-center text-xs text-slate-400 mt-4">
+              By creating an account you agree to our{' '}
+              <button onClick={() => setShowTerms(true)} className="text-sky-400 hover:underline">Terms of Service</button>
+              {' '}and{' '}
+              <button onClick={() => setShowPrivacy(true)} className="text-sky-400 hover:underline">Privacy Policy</button>
+            </p>
+          )}
+
+          {!isSignUp && (
+            <div className="flex justify-center gap-4 mt-4">
+              <button onClick={() => setShowPrivacy(true)} className="text-xs text-slate-400 hover:text-sky-500 hover:underline">Privacy Policy</button>
+              <button onClick={() => setShowTerms(true)} className="text-xs text-slate-400 hover:text-sky-500 hover:underline">Terms of Service</button>
+            </div>
+          )}
         </div>
       </div>
     </div>
