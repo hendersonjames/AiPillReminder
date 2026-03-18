@@ -5,30 +5,41 @@ import PillList from './components/PillList';
 import AddPillModal from './components/AddPillModal';
 import ChatModal from './components/ChatModal';
 import Auth from './components/Auth';
+import DoctorReport from './components/DoctorReport';
 import { ChatIcon, PlusIcon } from './components/icons/Icons';
 import { playSound } from './services/soundService';
 import { onAuthStateChange, signOut, type User } from './services/authService';
 import { loadPillsFromCloud, syncPillsToCloud } from './services/pillsService';
+import {
+  requestNotificationPermission,
+  getNotificationPermission,
+  fireImmediateNotification,
+  scheduleReminderNotifications,
+  cancelAllPillNotifications,
+  cancelReminderNotifications,
+  registerNotificationListeners,
+  isNative,
+} from './services/notificationService';
 
 const SYNC_DEBOUNCE_MS = 2000;
 
-// ─── Browser Notification helpers ────────────────────────────────────────────
+// ─── Web-only Notification helpers (used when not running natively) ───────────
 
-const requestNotificationPermission = async () => {
+const requestWebNotificationPermission = async () => {
   if (!('Notification' in window)) return;
   if (Notification.permission === 'default') {
     await Notification.requestPermission();
   }
 };
 
-const showNotification = (title: string, body: string) => {
+const showWebNotification = (title: string, body: string) => {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
   try {
     new Notification(title, {
       body,
       icon: '/favicon.ico',
       badge: '/favicon.ico',
-      tag: title, // prevents duplicate stacking
+      tag: title,
       renotify: true,
     });
   } catch (err) {
@@ -141,14 +152,23 @@ const App: React.FC = () => {
 
   const [isAddPillModalOpen, setAddPillModalOpen] = useState(false);
   const [isChatModalOpen, setChatModalOpen] = useState(false);
+  const [isReportOpen, setReportOpen] = useState(false);
   const [pillToEdit, setPillToEdit] = useState<Pill | undefined>(undefined);
 
   // ── Auth listener ──
   useEffect(() => {
-    const { data: { subscription } } = onAuthStateChange((currentUser) => {
+    const { data: { subscription } } = onAuthStateChange(async (currentUser) => {
       setUser(currentUser);
       setAuthLoading(false);
-      if (currentUser) requestNotificationPermission();
+      if (currentUser) {
+        // Request notification permission — native or web
+        await requestNotificationPermission();
+        if (!isNative()) await requestWebNotificationPermission();
+        // Register native notification tap handler
+        registerNotificationListeners((pillId, reminderId) => {
+          toggleReminderTaken(pillId, reminderId);
+        });
+      }
     });
     return () => subscription.unsubscribe();
   }, []);
@@ -228,11 +248,12 @@ const App: React.FC = () => {
         setPills(updatedPills);
         // Re-alarm for each expired snooze
         reAlarmPills.forEach(({ pillName, pillSound, reminderTime }) => {
-          playSound(pillSound);
-          showNotification(
-            `⏰ ${pillName}`,
-            `Your snoozed reminder for ${reminderTime} is due!`
-          );
+          if (isNative()) {
+            fireImmediateNotification(`⏰ ${pillName}`, `Your snoozed reminder for ${reminderTime} is due!`);
+          } else {
+            playSound(pillSound);
+            showWebNotification(`⏰ ${pillName}`, `Your snoozed reminder for ${reminderTime} is due!`);
+          }
         });
       }
     }, 1000 * 30);
@@ -275,13 +296,21 @@ const App: React.FC = () => {
           const isSnoozed = reminder.snoozedUntil && reminder.snoozedUntil > now.getTime();
 
           if (isDue && isToday && !reminder.taken && !isSnoozed) {
-            playSound(pill.notificationSound);
-            showNotification(
-              `💊 Time for ${pill.name}`,
-              pill.dosage
-                ? `${pill.dosage} — tap to open Remedi`
-                : 'Tap to open Remedi and mark as taken'
-            );
+            if (isNative()) {
+              // On native, OS already delivered the notification — just handle in-app feedback
+              fireImmediateNotification(
+                `💊 Time for ${pill.name}`,
+                pill.dosage ? `${pill.dosage} — tap to mark as taken` : 'Tap to mark as taken'
+              );
+            } else {
+              playSound(pill.notificationSound);
+              showWebNotification(
+                `💊 Time for ${pill.name}`,
+                pill.dosage
+                  ? `${pill.dosage} — tap to open Remedi`
+                  : 'Tap to open Remedi and mark as taken'
+              );
+            }
           }
         });
       });
@@ -302,12 +331,34 @@ const App: React.FC = () => {
 
   // ─── Handlers ───────────────────────────────────────────────────────────────
 
-  const savePill = (pillData: Omit<Pill, 'id' | 'history'> | Pill) => {
+  const savePill = async (pillData: Omit<Pill, 'id' | 'history'> | Pill) => {
+    let savedPill: Pill;
     if ('id' in pillData && pillData.id) {
-      setPills(prevPills => prevPills.map(p => (p.id === pillData.id ? { ...p, ...pillData } : p)));
+      savedPill = pillData as Pill;
+      setPills(prevPills => prevPills.map(p => (p.id === savedPill.id ? { ...p, ...savedPill } : p)));
+      // Cancel old notifications and reschedule with updated schedule
+      if (isNative()) {
+        const oldPill = pills.find(p => p.id === savedPill.id);
+        if (oldPill) await cancelAllPillNotifications(oldPill.id, oldPill.reminders);
+        for (const reminder of savedPill.reminders) {
+          await scheduleReminderNotifications(
+            savedPill.id, savedPill.name, savedPill.dosage,
+            reminder.id, reminder.time, reminder.daysOfWeek
+          );
+        }
+      }
     } else {
-      const newPill: Pill = { ...pillData, id: Date.now().toString(), history: [] };
-      setPills(prevPills => [...prevPills, newPill]);
+      savedPill = { ...pillData, id: Date.now().toString(), history: [] };
+      setPills(prevPills => [...prevPills, savedPill]);
+      // Schedule notifications for new pill
+      if (isNative()) {
+        for (const reminder of savedPill.reminders) {
+          await scheduleReminderNotifications(
+            savedPill.id, savedPill.name, savedPill.dosage,
+            reminder.id, reminder.time, reminder.daysOfWeek
+          );
+        }
+      }
     }
     setAddPillModalOpen(false);
     setPillToEdit(undefined);
@@ -372,7 +423,11 @@ const App: React.FC = () => {
     }));
   }, []);
 
-  const deletePill = useCallback((pillId: string) => {
+  const deletePill = useCallback(async (pillId: string) => {
+    const pill = pillsRef.current.find(p => p.id === pillId);
+    if (pill && isNative()) {
+      await cancelAllPillNotifications(pill.id, pill.reminders);
+    }
     setPills(prevPills => prevPills.filter(pill => pill.id !== pillId));
   }, []);
 
@@ -388,24 +443,23 @@ const App: React.FC = () => {
 
   if (!user) return <Auth />;
 
-  const showNotifBanner =
-    !notifDismissed &&
-    'Notification' in window &&
-    Notification.permission === 'denied';
-
   return (
     <div className="min-h-screen bg-sky-100 font-sans text-slate-800">
       <div className="container mx-auto max-w-2xl p-4 pb-28">
-        {/* Notification permission denied banner */}
-        {showNotifBanner && (
+        {/* Notification permission denied banner (web only) */}
+        {!isNative() && !notifDismissed &&
+          'Notification' in window &&
+          Notification.permission === 'denied' && (
           <div className="mb-3 p-3 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-800 flex items-start justify-between gap-2">
             <span>🔔 Notifications are blocked. Enable them in your browser settings to receive reminders.</span>
             <button onClick={() => setNotifDismissed(true)} className="text-amber-400 hover:text-amber-600 flex-shrink-0">✕</button>
           </div>
         )}
 
-        {/* Tab-open reminder banner (web limitation, shown once) */}
-        {!notifDismissed && !showNotifBanner && 'Notification' in window && Notification.permission === 'default' && (
+        {/* Tab-open reminder banner (web only, not yet granted) */}
+        {!isNative() && !notifDismissed &&
+          'Notification' in window &&
+          Notification.permission === 'default' && (
           <div className="mb-3 p-3 bg-sky-50 border border-sky-200 rounded-xl text-sm text-sky-800 flex items-start justify-between gap-2">
             <span>💡 Keep this tab open for reminders. Download the app for alarms that work even when your phone is locked.</span>
             <button onClick={() => setNotifDismissed(true)} className="text-sky-400 hover:text-sky-600 flex-shrink-0">✕</button>
@@ -418,6 +472,12 @@ const App: React.FC = () => {
             {syncStatus === 'syncing' && <span className="text-xs text-sky-500">Syncing...</span>}
             {syncStatus === 'synced' && <span className="text-xs text-green-500">☁ Saved</span>}
             {syncStatus === 'error' && <span className="text-xs text-red-400">Sync failed</span>}
+            <button
+              onClick={() => setReportOpen(true)}
+              className="text-xs text-sky-500 hover:text-sky-700 font-medium border border-sky-200 rounded-lg px-2 py-1 hover:bg-sky-50 transition-colors"
+            >
+              🩺 Report
+            </button>
             <button onClick={signOut} className="text-xs text-slate-400 hover:text-slate-600">Sign out</button>
           </div>
         </div>
@@ -438,6 +498,9 @@ const App: React.FC = () => {
       )}
       {isChatModalOpen && (
         <ChatModal onClose={() => setChatModalOpen(false)} />
+      )}
+      {isReportOpen && (
+        <DoctorReport pills={pills} onClose={() => setReportOpen(false)} />
       )}
 
       <div className="fixed bottom-0 left-0 right-0 h-24 bg-gradient-to-t from-sky-100 to-transparent pointer-events-none z-30"></div>
