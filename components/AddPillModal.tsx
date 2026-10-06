@@ -48,6 +48,12 @@ const DayOfWeekPicker: React.FC<{ selectedDays: number[]; onToggleDay: (dayIndex
 };
 
 
+interface ReminderFormData {
+  id?: string; // undefined for new reminders, existing ID for edited ones
+  time: string;
+  daysOfWeek: number[];
+}
+
 const AddPillModal: React.FC<AddPillModalProps> = ({ onClose, onSavePill, pillToEdit }) => {
   const isEditMode = !!pillToEdit;
   
@@ -55,8 +61,8 @@ const AddPillModal: React.FC<AddPillModalProps> = ({ onClose, onSavePill, pillTo
   const [dosage, setDosage] = useState(pillToEdit?.dosage || '');
   const [notes, setNotes] = useState(pillToEdit?.notes || '');
   const [notificationSound, setNotificationSound] = useState(pillToEdit?.notificationSound || 'default');
-  const [reminders, setReminders] = useState(
-    pillToEdit?.reminders.map(({ time, daysOfWeek }) => ({ time, daysOfWeek })) || 
+  const [reminders, setReminders] = useState<ReminderFormData[]>(
+    pillToEdit?.reminders.map(({ id, time, daysOfWeek }) => ({ id, time, daysOfWeek })) || 
     [{ time: '09:00', daysOfWeek: [0, 1, 2, 3, 4, 5, 6] }]
   );
   const [suggestion, setSuggestion] = useState('');
@@ -111,7 +117,12 @@ const AddPillModal: React.FC<AddPillModalProps> = ({ onClose, onSavePill, pillTo
         dosage,
         notes,
         notificationSound,
-        reminders: reminders.map(r => ({ ...r, id: Math.random().toString(), taken: false })),
+        reminders: reminders.map(r => ({
+          id: r.id || Math.random().toString(), // Preserve existing ID or generate new one
+          time: r.time,
+          daysOfWeek: r.daysOfWeek,
+          taken: false,
+        })),
       };
 
       if (isEditMode && pillToEdit) {

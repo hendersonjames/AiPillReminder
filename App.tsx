@@ -72,11 +72,12 @@ const recordMissedDoses = (pills: Pill[], setPills: React.Dispatch<React.SetStat
   yesterdayDate.setDate(yesterdayDate.getDate() - 1);
   const yesterdayDay = yesterdayDate.getDay();
 
-  const now = Date.now();
-  let anyChanges = false;
+  let anyGlobalChanges = false;
 
   const updatedPills = pills.map(pill => {
     const newHistory = [...(pill.history || [])];
+    let pillHasChanges = false;
+    
     pill.reminders.forEach(reminder => {
       if (!reminder.daysOfWeek.includes(yesterdayDay)) return; // not scheduled yesterday
       if (reminder.taken) return; // taken today resets at midnight — handled separately
@@ -103,13 +104,14 @@ const recordMissedDoses = (pills: Pill[], setPills: React.Dispatch<React.SetStat
           action: 'missed',
           timestamp: yesterdayEnd.getTime(),
         });
-        anyChanges = true;
+        pillHasChanges = true;
+        anyGlobalChanges = true;
       }
     });
-    return anyChanges ? { ...pill, history: newHistory } : pill;
+    return pillHasChanges ? { ...pill, history: newHistory } : pill;
   });
 
-  if (anyChanges) {
+  if (anyGlobalChanges) {
     setPills(updatedPills);
   }
   localStorage.setItem(MISSED_DOSE_SWEEP_KEY, yesterday);
