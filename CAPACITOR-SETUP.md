@@ -130,9 +130,9 @@ on every push to `main`.
 **Setup required:**
 1. Go to GitHub → Settings → Secrets → Actions
 2. Add these secrets:
-   - `VITE_SUPABASE_URL` → your Supabase URL
-   - `VITE_SUPABASE_PUBLISHABLE_KEY` → your Supabase anon key (JWT format)
-   - `GEMINI_API_KEY` → your Gemini API key
+   - `VITE_SUPABASE_URL` → your Supabase project URL
+   - `VITE_SUPABASE_PUBLISHABLE_KEY` → your Supabase anon/public key
+   - `GEMINI_API_KEY` → your Gemini API key (optional, for AI features)
 3. Push any change to `main`
 4. Go to Actions tab → download the APK from Artifacts
 

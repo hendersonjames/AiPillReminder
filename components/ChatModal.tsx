@@ -39,7 +39,7 @@ const ChatModal: React.FC<ChatModalProps> = ({ onClose }) => {
     setIsLoading(false);
   };
   
-  const handleKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') {
       handleSend();
     }
@@ -128,7 +128,7 @@ const ChatModal: React.FC<ChatModalProps> = ({ onClose }) => {
               type="text"
               value={input}
               onChange={e => setInput(e.target.value)}
-              onKeyPress={handleKeyPress}
+              onKeyDown={handleKeyDown}
               placeholder="Ask a question..."
               className="w-full px-4 py-2 border border-slate-300 rounded-full focus:ring-2 focus:ring-sky-500 focus:border-sky-500"
               disabled={isLoading}
