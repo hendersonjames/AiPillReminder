@@ -22,10 +22,6 @@ export default defineConfig(() => {
       sourcemap: false,
       // Capacitor WebView works best with these settings
       target: 'es2015',
-      rollupOptions: {
-        // Ensure @google/genai is not bundled into the client (it's server-side only)
-        external: ['@google/genai'],
-      },
     },
   };
 });
