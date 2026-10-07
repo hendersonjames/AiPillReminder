@@ -25,8 +25,8 @@ import {
   MAX_RAW_BODY_SIZE,
   MAX_PILL_NAME_LENGTH,
   MAX_OUTPUT_TOKENS_CHAT,
+  MAX_OUTPUT_TOKENS_CHAT_THINKING,
   MAX_OUTPUT_TOKENS_SUGGESTION,
-  THINKING_BUDGET_MAX,
 } from '../../api/gemini';
 
 // ─── Test Utilities ──────────────────────────────────────────────────────────
@@ -795,7 +795,7 @@ async function runTests(): Promise<void> {
     assert(params?.model === 'gemini-3.5-flash-lite', `Expected gemini-3.5-flash-lite, got ${params?.model}`);
   }
 
-  console.log('\nTest: thinkingLevel is MEDIUM, thinkingBudget capped, and maxOutputTokens is 2048 for thinking mode');
+  console.log('\nTest: thinkingLevel is MEDIUM (no thinkingBudget) and maxOutputTokens is 8192 for thinking mode');
   {
     const state = createFakeState();
     const rateLimitState: RateLimitState = { map: new Map() };
@@ -813,13 +813,14 @@ async function runTests(): Promise<void> {
       params?.config?.thinkingConfig?.thinkingLevel === ThinkingLevel.MEDIUM,
       `Expected MEDIUM, got ${params?.config?.thinkingConfig?.thinkingLevel}`
     );
+    // Gemini 3 returns 400 if both thinkingLevel and thinkingBudget are set
     assert(
-      params?.config?.thinkingConfig?.thinkingBudget === THINKING_BUDGET_MAX,
-      `Expected thinkingBudget ${THINKING_BUDGET_MAX}, got ${params?.config?.thinkingConfig?.thinkingBudget}`
+      !('thinkingBudget' in (params?.config?.thinkingConfig || {})),
+      'thinkingBudget should not be present'
     );
     assert(
-      params?.config?.maxOutputTokens === MAX_OUTPUT_TOKENS_CHAT,
-      `Expected ${MAX_OUTPUT_TOKENS_CHAT}, got ${params?.config?.maxOutputTokens}`
+      params?.config?.maxOutputTokens === MAX_OUTPUT_TOKENS_CHAT_THINKING,
+      `Expected ${MAX_OUTPUT_TOKENS_CHAT_THINKING}, got ${params?.config?.maxOutputTokens}`
     );
     assert(params?.model === 'gemini-3.5-flash', `Expected gemini-3.5-flash, got ${params?.model}`);
   }

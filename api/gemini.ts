@@ -26,8 +26,8 @@ const RATE_LIMIT_CLEANUP_THRESHOLD = 100;
 
 // Cost ceilings
 export const MAX_OUTPUT_TOKENS_CHAT = 2048;
+export const MAX_OUTPUT_TOKENS_CHAT_THINKING = 8192;
 export const MAX_OUTPUT_TOKENS_SUGGESTION = 64;
-export const THINKING_BUDGET_MAX = 2048;
 
 // Pill name validation: letters, numbers, spaces, hyphens, basic punctuation
 const PILL_NAME_PATTERN = /^[\p{L}\p{N}\s\-'.,()]+$/u;
@@ -69,7 +69,7 @@ export interface GenerateContentParams {
   contents: string | Array<{ role: string; parts: Array<{ text: string }> }>;
   config?: {
     systemInstruction?: string;
-    thinkingConfig?: { thinkingLevel?: ThinkingLevel; thinkingBudget?: number };
+    thinkingConfig?: { thinkingLevel?: ThinkingLevel };
     maxOutputTokens?: number;
   };
 }
@@ -383,8 +383,10 @@ export function createHandler(
         
         const model = isThinkingMode ? 'gemini-3.5-flash' : 'gemini-3.5-flash-lite';
         
-        // Use thinkingLevel for Gemini 3.x models with budget cap
+        // Use thinkingLevel only (not thinkingBudget) for Gemini 3.x — setting both returns 400
         const thinkingLevel = isThinkingMode ? ThinkingLevel.MEDIUM : ThinkingLevel.MINIMAL;
+        // Thinking mode needs higher output cap because thinking tokens count toward the limit
+        const maxOutputTokens = isThinkingMode ? MAX_OUTPUT_TOKENS_CHAT_THINKING : MAX_OUTPUT_TOKENS_CHAT;
         
         const contents = trimmedHistory.map((msg) => ({
           role: msg.author === 'user' ? 'user' : 'model',
@@ -397,8 +399,8 @@ export function createHandler(
           contents: contents,
           config: {
             systemInstruction: "You are a helpful assistant for a pill reminder app named ChronaCare. Provide concise and clear information. Do NOT provide medical advice under any circumstances. If asked for medical advice, gently decline and firmly suggest consulting a healthcare professional. You can answer general knowledge questions about medications, but always preface with a disclaimer that you are not a medical professional.",
-            thinkingConfig: { thinkingLevel, thinkingBudget: THINKING_BUDGET_MAX },
-            maxOutputTokens: MAX_OUTPUT_TOKENS_CHAT,
+            thinkingConfig: { thinkingLevel },
+            maxOutputTokens,
           },
         });
         
