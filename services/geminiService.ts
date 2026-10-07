@@ -1,38 +1,69 @@
-import { GoogleGenAI } from "@google/genai";
 import { ChatMessage, MessageAuthor } from "../types";
+import { supabase } from "../lib/supabase";
 
-const API_KEY = import.meta.env.GEMINI_API_KEY;
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 
-let ai: GoogleGenAI | null = null;
+let geminiConfiguredCache: boolean | null = null;
 
-const getAI = (): GoogleGenAI | null => {
-  if (!API_KEY) return null;
-  if (!ai) {
-    ai = new GoogleGenAI({ apiKey: API_KEY });
+async function getAuthToken(): Promise<string | null> {
+  const { data: { session } } = await supabase.auth.getSession();
+  return session?.access_token || null;
+}
+
+async function callGeminiApi(body: object): Promise<{ text?: string; error?: string; configured?: boolean }> {
+  const token = await getAuthToken();
+  
+  if (!token) {
+    return { error: "Please sign in to use AI features." };
   }
-  return ai;
-};
+  
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/gemini`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    
+    const data = await response.json();
+    
+    if (!response.ok) {
+      if (response.status === 503 && data.configured === false) {
+        geminiConfiguredCache = false;
+      }
+      return { error: data.error || 'Failed to get AI response' };
+    }
+    
+    geminiConfiguredCache = true;
+    return data;
+  } catch (error) {
+    console.error('API call error:', error);
+    return { error: 'Failed to connect to AI service. Please try again.' };
+  }
+}
 
-export const isGeminiConfigured = (): boolean => Boolean(API_KEY);
+export const isGeminiConfigured = (): boolean => {
+  return geminiConfiguredCache !== false;
+};
 
 export const getQuickSuggestion = async (pillName: string): Promise<string> => {
   if (!pillName.trim()) return "";
   
-  const client = getAI();
-  if (!client) {
-    return "AI suggestions unavailable (API key not configured)";
-  }
+  const result = await callGeminiApi({
+    action: 'suggestion',
+    pillName: pillName.trim(),
+  });
   
-  try {
-    const response = await client.models.generateContent({
-      model: 'gemini-3.5-flash-lite',
-      contents: `Provide a brief, one-sentence description for the medication "${pillName}". Do not include any warnings or medical advice. Keep it under 15 words.`,
-    });
-    return response.text.trim();
-  } catch (error) {
-    console.error("Error fetching quick suggestion:", error);
+  if (result.error) {
+    if (result.error.includes('unavailable')) {
+      return "AI suggestions unavailable (API key not configured)";
+    }
     return "Could not fetch suggestion.";
   }
+  
+  return result.text || "Could not fetch suggestion.";
 };
 
 export const getChatResponse = async (
@@ -40,40 +71,22 @@ export const getChatResponse = async (
   newMessage: string,
   isThinkingMode: boolean
 ): Promise<string> => {
-  const client = getAI();
-  if (!client) {
-    return "AI chat is unavailable. Please configure the GEMINI_API_KEY environment variable to enable AI features.";
+  const result = await callGeminiApi({
+    action: 'chat',
+    message: newMessage,
+    history: history.map(msg => ({
+      author: msg.author === MessageAuthor.USER ? 'user' : 'bot',
+      text: msg.text,
+    })),
+    isThinkingMode,
+  });
+  
+  if (result.error) {
+    if (result.error.includes('unavailable')) {
+      return "AI chat is unavailable. Please configure the GEMINI_API_KEY environment variable to enable AI features.";
+    }
+    return result.error;
   }
   
-  try {
-    const model = isThinkingMode ? 'gemini-3.5-flash' : 'gemini-3.5-flash-lite';
-    
-    const config: {
-      systemInstruction: string;
-      thinkingConfig?: { thinkingBudget: number };
-    } = {
-      systemInstruction: "You are a helpful assistant for a pill reminder app named ChronaCare. Provide concise and clear information. Do NOT provide medical advice under any circumstances. If asked for medical advice, gently decline and firmly suggest consulting a healthcare professional. You can answer general knowledge questions about medications, but always preface with a disclaimer that you are not a medical professional."
-    };
-    
-    if (isThinkingMode) {
-      config.thinkingConfig = { thinkingBudget: 32768 };
-    }
-
-    const contents = history.map((msg) => ({
-      role: msg.author === MessageAuthor.USER ? 'user' : 'model',
-      parts: [{ text: msg.text }],
-    }));
-    contents.push({ role: 'user', parts: [{ text: newMessage }] });
-
-    const response = await client.models.generateContent({
-        model: model,
-        contents: contents,
-        config: config,
-    });
-    
-    return response.text.trim();
-  } catch (error) {
-    console.error("Error fetching chat response:", error);
-    return "Sorry, I encountered an error. Please try again.";
-  }
+  return result.text || "Sorry, I encountered an error. Please try again.";
 };

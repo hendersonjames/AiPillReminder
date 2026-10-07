@@ -16,14 +16,15 @@
     "@capacitor/core": "^7.0.0",
     "@capacitor/haptics": "^7.0.0",
     "@capacitor/local-notifications": "^7.0.0",
-    "@google/genai": "^1.26.0",
     "@supabase/supabase-js": "^2.49.4",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
   "devDependencies": {
     "@capacitor/cli": "^7.0.0",
+    "@google/genai": "^2.27.0",
     "@types/node": "^22.14.0",
+    "@vercel/node": "^22.0.0",
     "@vitejs/plugin-react": "^5.2.0",
     "typescript": "~5.8.2",
     "vite": "^6.4.1"
