@@ -3,10 +3,17 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "typecheck:api": "tsc --noEmit -p api/tsconfig.json",
+    "test:api": "npx tsx tests/api/gemini.test.ts",
+    "check:bundle": "! grep -rE '@google/genai|GoogleGenAI|AIza' dist/",
     "cap:sync": "vite build && npx cap sync",
     "cap:android": "vite build && npx cap sync && npx cap open android",
     "cap:ios": "vite build && npx cap sync && npx cap open ios"
@@ -16,7 +23,7 @@
     "@capacitor/core": "^7.0.0",
     "@capacitor/haptics": "^7.0.0",
     "@capacitor/local-notifications": "^7.0.0",
-    "@google/genai": "^1.26.0",
+    "@google/genai": "^2.27.0",
     "@supabase/supabase-js": "^2.49.4",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
@@ -25,6 +32,7 @@
     "@capacitor/cli": "^7.0.0",
     "@types/node": "^22.14.0",
     "@vitejs/plugin-react": "^5.2.0",
+    "tsx": "^4.23.15",
     "typescript": "~5.8.2",
     "vite": "^6.4.1"
   }
