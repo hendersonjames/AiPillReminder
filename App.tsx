@@ -5,10 +5,11 @@ import PillList from './components/PillList';
 import AddPillModal from './components/AddPillModal';
 import ChatModal from './components/ChatModal';
 import Auth from './components/Auth';
+import ResetPassword from './components/ResetPassword';
 import DoctorReport from './components/DoctorReport';
 import { ChatIcon, PlusIcon } from './components/icons/Icons';
 import { playSound } from './services/soundService';
-import { onAuthStateChange, signOut, type User } from './services/authService';
+import { onAuthStateChange, signOut, type User, type AuthEvent } from './services/authService';
 import { loadPillsFromCloud, syncPillsToCloud } from './services/pillsService';
 import {
   requestNotificationPermission,
@@ -134,6 +135,7 @@ const resetTakenAtMidnight = (setPills: React.Dispatch<React.SetStateAction<Pill
 const App: React.FC = () => {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
+  const [isPasswordRecovery, setIsPasswordRecovery] = useState(false);
   const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
   const [notifDismissed, setNotifDismissed] = useState(false);
   const syncTimeoutRef = useRef<number | undefined>(undefined);
@@ -159,10 +161,17 @@ const App: React.FC = () => {
 
   // ── Auth listener ──
   useEffect(() => {
-    const { data: { subscription } } = onAuthStateChange(async (currentUser) => {
+    const { data: { subscription } } = onAuthStateChange(async (currentUser, event) => {
       setUser(currentUser);
       setAuthLoading(false);
-      if (currentUser) {
+
+      // Detect password recovery flow (user clicked reset link from email)
+      if (event === 'PASSWORD_RECOVERY') {
+        setIsPasswordRecovery(true);
+        return;
+      }
+
+      if (currentUser && !isPasswordRecovery) {
         // Request notification permission — native or web
         await requestNotificationPermission();
         if (!isNative()) await requestWebNotificationPermission();
@@ -173,7 +182,7 @@ const App: React.FC = () => {
       }
     });
     return () => subscription.unsubscribe();
-  }, []);
+  }, [isPasswordRecovery]);
 
   // ── Load from cloud on login ──
   useEffect(() => {
@@ -441,6 +450,11 @@ const App: React.FC = () => {
         <div className="text-slate-500">Loading...</div>
       </div>
     );
+  }
+
+  // Show password reset screen when user clicked recovery link from email
+  if (isPasswordRecovery && user) {
+    return <ResetPassword onComplete={() => setIsPasswordRecovery(false)} />;
   }
 
   if (!user) return <Auth />;

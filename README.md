@@ -57,6 +57,18 @@ Set these environment variables in your Vercel project settings:
 
 Run the SQL in `supabase-schema.sql` in your Supabase SQL Editor to create the required tables.
 
+#### Password Reset Redirect URLs
+
+For the password reset flow to work correctly, you must configure the redirect URLs in your Supabase project dashboard:
+
+1. Go to your Supabase project → **Authentication** → **URL Configuration**
+2. Add the following URLs to **Redirect URLs**:
+   - `https://ai-pill-reminder.vercel.app/**` (production)
+   - `https://*-hendersonjames-projects.vercel.app/**` (Vercel preview deployments)
+   - `http://localhost:5173/**` (local development)
+
+The password reset email will contain a link that redirects users back to your app with a recovery token. Without the correct redirect URLs configured, the reset link will fail.
+
 ## Build for Production
 
 ```bash
