@@ -468,19 +468,28 @@ const App: React.FC = () => {
           </div>
         )}
 
-        <div className="flex justify-between items-center pt-2 pb-1">
+        <div className="flex flex-wrap justify-between items-center gap-2 pt-2 pb-1">
           <Header />
-          <div className="flex items-center gap-2">
-            {syncStatus === 'syncing' && <span className="text-xs text-sky-500">Syncing...</span>}
-            {syncStatus === 'synced' && <span className="text-xs text-green-500">☁ Saved</span>}
-            {syncStatus === 'error' && <span className="text-xs text-red-400">Sync failed</span>}
+          <div className="flex items-center gap-1 sm:gap-2 flex-shrink-0">
+            {syncStatus === 'syncing' && <span className="text-xs text-sky-500 hidden sm:inline">Syncing...</span>}
+            {syncStatus === 'synced' && <span className="text-xs text-green-500">☁<span className="hidden sm:inline"> Saved</span></span>}
+            {syncStatus === 'error' && <span className="text-xs text-red-400">⚠<span className="hidden sm:inline"> Sync failed</span></span>}
             <button
               onClick={() => setReportOpen(true)}
-              className="text-xs text-sky-500 hover:text-sky-700 font-medium border border-sky-200 rounded-lg px-2 py-1 hover:bg-sky-50 transition-colors"
+              className="min-w-[44px] min-h-[44px] flex items-center justify-center text-xs text-sky-500 hover:text-sky-700 font-medium border border-sky-200 rounded-lg px-2 sm:px-2 hover:bg-sky-50 transition-colors"
+              aria-label="View doctor report"
             >
-              🩺 Report
+              <span className="sm:hidden text-base">🩺</span>
+              <span className="hidden sm:inline">🩺 Report</span>
             </button>
-            <button onClick={signOut} className="text-xs text-slate-400 hover:text-slate-600">Sign out</button>
+            <button
+              onClick={signOut}
+              className="min-w-[44px] min-h-[44px] flex items-center justify-center text-xs text-slate-400 hover:text-slate-600"
+              aria-label="Sign out"
+            >
+              <span className="sm:hidden text-base">🚪</span>
+              <span className="hidden sm:inline">Sign out</span>
+            </button>
           </div>
         </div>
 
