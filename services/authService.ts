@@ -1,5 +1,5 @@
 // services/authService.ts
-import { supabase } from '../lib/supabase';
+import { supabase, forceRemoveSession, hasSessionInStorage } from '../lib/supabase';
 import { wipeLocalUserData } from '../lib/storage';
 import { cancelAllScheduledNotifications } from './notificationService';
 import type { User } from '../lib/supabase';
@@ -10,6 +10,7 @@ export interface SignOutResult {
   success: boolean;
   localOnly: boolean;
   error?: string;
+  requiresReload?: boolean;
 }
 
 export const signUp = async (email: string, password: string) => {
@@ -33,31 +34,50 @@ export const signInWithGoogle = async () => {
   return data;
 };
 
-// Sign out with retry on network failure
-// Always clears local session and user data, even if server revocation fails
-export const signOut = async (userId?: string): Promise<SignOutResult> => {
-  // Cancel native notifications BEFORE anything else
-  // This ensures A's medication names don't keep showing up
+// Flush pending sync before sign-out (optional callback from App)
+// This must be called BEFORE signOut() to save the current user's edits
+export type FlushCallback = () => Promise<void>;
+
+// Sign out with guaranteed local session removal
+// Even on network failure, the device WILL be signed out
+export const signOut = async (
+  userId?: string,
+  flushPendingSync?: FlushCallback
+): Promise<SignOutResult> => {
+  // 1. Flush pending edits BEFORE anything else (while still authenticated)
+  if (flushPendingSync) {
+    try {
+      await flushPendingSync();
+    } catch (err) {
+      console.warn('Failed to flush pending sync before sign-out:', err);
+    }
+  }
+
+  // 2. Cancel native notifications
   await cancelAllScheduledNotifications();
 
-  // Try global sign-out (revokes all sessions on server)
+  // 3. Try global sign-out (revokes all sessions on server)
   const { error: globalError } = await supabase.auth.signOut();
   
   if (globalError) {
-    // Network failure or server error - fall back to local-only sign-out
-    // This removes the local session so the device is signed out
-    const { error: localError } = await supabase.auth.signOut({ scope: 'local' });
+    // Network failure or server error
+    // signOut({scope:'local'}) also makes a network call in supabase-js 2.x
+    // So we force-remove the session directly from storage
+    forceRemoveSession();
     
     // Clear user data AFTER session is removed
     if (userId) {
       wipeLocalUserData(userId);
     }
     
-    if (localError) {
+    // Verify session is actually gone
+    if (hasSessionInStorage()) {
+      // Session still exists - this shouldn't happen but handle it
       return {
         success: false,
         localOnly: true,
         error: 'Could not sign out. Please try again.',
+        requiresReload: true,
       };
     }
     
@@ -65,6 +85,7 @@ export const signOut = async (userId?: string): Promise<SignOutResult> => {
       success: true,
       localOnly: true,
       error: 'Signed out on this device; could not reach server to revoke other sessions.',
+      requiresReload: true, // Hard reload ensures clean state
     };
   }
   

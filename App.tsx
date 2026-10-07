@@ -8,7 +8,7 @@ import Auth from './components/Auth';
 import DoctorReport from './components/DoctorReport';
 import { ChatIcon, PlusIcon } from './components/icons/Icons';
 import { playSound } from './services/soundService';
-import { onAuthStateChange, signOut, cleanupUserData, type User, type SignOutResult } from './services/authService';
+import { onAuthStateChange, signOut, cleanupUserData, type User } from './services/authService';
 import { loadPillsFromCloud, syncPillsToCloud } from './services/pillsService';
 import {
   requestNotificationPermission,
@@ -19,6 +19,7 @@ import {
   scheduleAllPillNotifications,
   registerNotificationListeners,
   isNative,
+  type NotificationListenerHandle,
 } from './services/notificationService';
 import {
   loadPillsFromStorage,
@@ -79,10 +80,10 @@ const App: React.FC = () => {
   
   // Track previous user ID to detect user switches
   const prevUserIdRef = useRef<string | null>(null);
-  // Flag to block writes during sign-out
+  // Flag to block writes during sign-out (shared with SignedInApp)
   const signingOutRef = useRef(false);
-  // Listener registered flag
-  const listenerRegisteredRef = useRef(false);
+  // Flush callback from SignedInApp
+  const flushCallbackRef = useRef<(() => Promise<void>) | null>(null);
 
   // ─── Auth listener ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -126,14 +127,6 @@ const App: React.FC = () => {
         // Request notification permission — native or web
         await requestNotificationPermission();
         if (!isNative()) await requestWebNotificationPermission();
-        
-        // Register native notification tap handler (once)
-        if (!listenerRegisteredRef.current) {
-          listenerRegisteredRef.current = true;
-          registerNotificationListeners(() => {
-            // Notification tap handling is done in SignedInApp
-          });
-        }
       }
     });
     return () => subscription.unsubscribe();
@@ -144,16 +137,30 @@ const App: React.FC = () => {
     signingOutRef.current = true;
     setSignOutError(null);
     
-    const result = await signOut(currentUserId ?? undefined);
+    // Pass flush callback to signOut so it can save pending edits BEFORE clearing
+    const result = await signOut(
+      currentUserId ?? undefined,
+      flushCallbackRef.current ?? undefined
+    );
     
     if (!result.success) {
       setSignOutError(result.error ?? 'Sign out failed');
-      signingOutRef.current = false;
+      // Keep signingOutRef true to block writes
     } else if (result.localOnly && result.error) {
-      // Partial success - show warning but continue
+      // Partial success - show warning
       setSignOutError(result.error);
     }
-    // On success, SIGNED_OUT event will handle the rest
+    
+    // Hard reload if required (ensures clean state after offline sign-out)
+    if (result.requiresReload) {
+      window.location.reload();
+      return;
+    }
+    
+    // On normal success, SIGNED_OUT event will handle the rest
+    if (result.success && !result.localOnly) {
+      signingOutRef.current = false;
+    }
   }, []);
 
   // ─── Render ─────────────────────────────────────────────────────────────────
@@ -175,6 +182,7 @@ const App: React.FC = () => {
       user={user}
       userId={userId}
       signingOutRef={signingOutRef}
+      flushCallbackRef={flushCallbackRef}
       signOutError={signOutError}
       onSignOut={handleSignOut}
       onClearError={() => setSignOutError(null)}
@@ -188,6 +196,7 @@ interface SignedInAppProps {
   user: User;
   userId: string;
   signingOutRef: React.MutableRefObject<boolean>;
+  flushCallbackRef: React.MutableRefObject<(() => Promise<void>) | null>;
   signOutError: string | null;
   onSignOut: () => void;
   onClearError: () => void;
@@ -197,6 +206,7 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   user,
   userId,
   signingOutRef,
+  flushCallbackRef,
   signOutError,
   onSignOut,
   onClearError,
@@ -211,6 +221,8 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   const syncTimeoutRef = useRef<number | undefined>(undefined);
   const pillsRef = useRef<Pill[]>([]);
   const cloudIdsRef = useRef<Set<string>>(new Set());
+  // Notification listener handle for cleanup
+  const notifListenerRef = useRef<NotificationListenerHandle | null>(null);
 
   const [pills, setPills] = useState<Pill[]>([]);
 
@@ -223,9 +235,63 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   // Keep ref in sync
   useEffect(() => { pillsRef.current = pills; }, [pills]);
 
-  // ─── Flush pending sync (for visibilitychange/pagehide) ───────────────────
+  // ─── Mark taken handler (for notification taps) ─────────────────────────────
+  const markReminderTaken = useCallback((pillId: string, reminderId: string) => {
+    setPills(prevPills => prevPills.map(pill => {
+      if (pill.id === pillId) {
+        const history = pill.history || [];
+        const alreadyTaken = isReminderTakenToday(history, reminderId);
+        
+        if (alreadyTaken) return pill;
+        
+        const reminder = pill.reminders.find(r => r.id === reminderId);
+        if (!reminder) return pill;
+        
+        const newHistoryEntry: HistoryEntry = {
+          id: `${Date.now()}-${reminderId}`,
+          reminderId: reminderId,
+          pillName: pill.name,
+          time: reminder.time,
+          action: 'taken',
+          timestamp: Date.now(),
+        };
+        
+        const updatedReminders = pill.reminders.map(r =>
+          r.id === reminderId ? { ...r, snoozedUntil: undefined, taken: true } : r
+        );
+        
+        return {
+          ...pill,
+          reminders: updatedReminders,
+          history: [...history, newHistoryEntry],
+        };
+      }
+      return pill;
+    }));
+  }, []);
+
+  // ─── Register notification listener inside SignedInApp (B2 fix) ─────────────
+  useEffect(() => {
+    const setupListener = async () => {
+      if (isNative()) {
+        notifListenerRef.current = await registerNotificationListeners(markReminderTaken);
+      }
+    };
+    setupListener();
+    
+    return () => {
+      // Clean up listener on unmount (sign-out or user change)
+      if (notifListenerRef.current) {
+        notifListenerRef.current.remove();
+        notifListenerRef.current = null;
+      }
+    };
+  }, [markReminderTaken]);
+
+  // ─── Flush pending sync (for visibilitychange/pagehide AND sign-out) ────────
   const flushPendingSync = useCallback(async () => {
-    if (signingOutRef.current) return;
+    // Allow flush during sign-out (we WANT to save before clearing)
+    // But don't flush if not for this user
     if (!cloudLoadSucceededRef.current) return;
     if (loadedForUserIdRef.current !== userId) return;
     
@@ -249,6 +315,14 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       console.error('Flush sync failed:', err);
     }
   }, [userId]);
+
+  // Register flush callback for sign-out to use
+  useEffect(() => {
+    flushCallbackRef.current = flushPendingSync;
+    return () => {
+      flushCallbackRef.current = null;
+    };
+  }, [flushPendingSync, flushCallbackRef]);
 
   // ─── Load from cloud on mount ───────────────────────────────────────────────
   useEffect(() => {
@@ -368,13 +442,15 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   // ─── Flush sync on tab close/hide ───────────────────────────────────────────
   useEffect(() => {
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') {
+      if (document.visibilityState === 'hidden' && !signingOutRef.current) {
         flushPendingSync();
       }
     };
     
     const handlePageHide = () => {
-      flushPendingSync();
+      if (!signingOutRef.current) {
+        flushPendingSync();
+      }
     };
     
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -387,44 +463,51 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   }, [flushPendingSync]);
 
   // ─── Snooze expiry check (every 30s) — re-triggers alarm when snooze ends ───
-  // Uses functional updater to avoid stale state issues (S5)
+  // Compute due alarms from ref OUTSIDE the updater, then do state update
   useEffect(() => {
     const interval = setInterval(() => {
       const now = Date.now();
-      const reAlarmItems: { pillName: string; pillSound?: string; reminderTime: string }[] = [];
-
-      setPills(prev => {
-        let hasChanges = false;
-        
-        const updatedPills = prev.map(pill => {
-          const newReminders = pill.reminders.map(reminder => {
-            if (reminder.snoozedUntil && reminder.snoozedUntil <= now) {
-              hasChanges = true;
-              reAlarmItems.push({
-                pillName: pill.name,
-                pillSound: pill.notificationSound,
-                reminderTime: reminder.time,
-              });
+      
+      // Compute which alarms are due from current pills ref
+      const dueAlarms: { pillName: string; pillSound?: string; reminderTime: string }[] = [];
+      const expiredReminderIds = new Set<string>();
+      
+      pillsRef.current.forEach(pill => {
+        pill.reminders.forEach(reminder => {
+          if (reminder.snoozedUntil && reminder.snoozedUntil <= now) {
+            dueAlarms.push({
+              pillName: pill.name,
+              pillSound: pill.notificationSound,
+              reminderTime: reminder.time,
+            });
+            expiredReminderIds.add(`${pill.id}:${reminder.id}`);
+          }
+        });
+      });
+      
+      // Only update state if there are expired snoozes
+      if (expiredReminderIds.size > 0) {
+        setPills(prev => prev.map(pill => ({
+          ...pill,
+          reminders: pill.reminders.map(reminder => {
+            if (expiredReminderIds.has(`${pill.id}:${reminder.id}`)) {
               const { snoozedUntil, ...rest } = reminder;
               return rest;
             }
             return reminder;
-          });
-          return hasChanges ? { ...pill, reminders: newReminders } : pill;
-        });
+          }),
+        })));
         
-        return hasChanges ? updatedPills : prev;
-      });
-
-      // Fire alarms outside the updater
-      reAlarmItems.forEach(({ pillName, pillSound, reminderTime }) => {
-        if (isNative()) {
-          fireImmediateNotification(`⏰ ${pillName}`, `Your snoozed reminder for ${reminderTime} is due!`);
-        } else {
-          playSound(pillSound);
-          showWebNotification(`⏰ ${pillName}`, `Your snoozed reminder for ${reminderTime} is due!`);
-        }
-      });
+        // Fire alarms
+        dueAlarms.forEach(({ pillName, pillSound, reminderTime }) => {
+          if (isNative()) {
+            fireImmediateNotification(`⏰ ${pillName}`, `Your snoozed reminder for ${reminderTime} is due!`);
+          } else {
+            playSound(pillSound);
+            showWebNotification(`⏰ ${pillName}`, `Your snoozed reminder for ${reminderTime} is due!`);
+          }
+        });
+      }
     }, 1000 * 30);
     return () => clearInterval(interval);
   }, []);
@@ -563,41 +646,6 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   const openAddModal = () => { setPillToEdit(undefined); setAddPillModalOpen(true); };
   const openEditModal = (pill: Pill) => { setPillToEdit(pill); setAddPillModalOpen(true); };
   const closeModal = () => { setAddPillModalOpen(false); setPillToEdit(undefined); };
-
-  // Mark taken (idempotent - for notification taps)
-  const markReminderTaken = useCallback((pillId: string, reminderId: string) => {
-    setPills(prevPills => prevPills.map(pill => {
-      if (pill.id === pillId) {
-        const history = pill.history || [];
-        const alreadyTaken = isReminderTakenToday(history, reminderId);
-        
-        if (alreadyTaken) return pill;
-        
-        const reminder = pill.reminders.find(r => r.id === reminderId);
-        if (!reminder) return pill;
-        
-        const newHistoryEntry: HistoryEntry = {
-          id: `${Date.now()}-${reminderId}`,
-          reminderId: reminderId,
-          pillName: pill.name,
-          time: reminder.time,
-          action: 'taken',
-          timestamp: Date.now(),
-        };
-        
-        const updatedReminders = pill.reminders.map(r =>
-          r.id === reminderId ? { ...r, snoozedUntil: undefined, taken: true } : r
-        );
-        
-        return {
-          ...pill,
-          reminders: updatedReminders,
-          history: [...history, newHistoryEntry],
-        };
-      }
-      return pill;
-    }));
-  }, []);
 
   // Toggle taken (for UI - allows un-marking)
   const toggleReminderTaken = useCallback((pillId: string, reminderId: string) => {

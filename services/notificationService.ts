@@ -276,20 +276,26 @@ export const scheduleAllPillNotifications = async (
   }
 };
 
+// ─── Notification listener handle for cleanup ─────────────────────────────────
+
+export interface NotificationListenerHandle {
+  remove: () => Promise<void>;
+}
+
 // ─── Register notification action handlers ────────────────────────────────────
 //
 // Set up listeners for when a user taps a notification.
-// Call this once at app startup.
+// Returns a handle that can be used to remove the listener on unmount.
 
 export const registerNotificationListeners = async (
   onReminderTapped: (pillId: string, reminderId: string) => void
-) => {
-  if (!isNative()) return;
+): Promise<NotificationListenerHandle | null> => {
+  if (!isNative()) return null;
 
   await loadNativePlugins();
 
   // User tapped a notification while app was in background/closed
-  await LocalNotifications.addListener(
+  const handle = await LocalNotifications.addListener(
     'localNotificationActionPerformed',
     (action: any) => {
       const extra = action?.notification?.extra;
@@ -298,4 +304,6 @@ export const registerNotificationListeners = async (
       }
     }
   );
+  
+  return handle;
 };
