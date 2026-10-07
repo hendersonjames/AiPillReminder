@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -10,11 +10,30 @@ const MAX_MESSAGE_LENGTH = 10000;
 const MAX_HISTORY_LENGTH = 50;
 const MAX_PILL_NAME_LENGTH = 200;
 
+// In-memory rate limiter. This is per-instance and best-effort only—requests
+// may land on different serverless instances. For durable rate limiting,
+// consider using a Supabase table or Upstash Redis.
+// TODO: Migrate to a durable rate limiter (Supabase table or Upstash)
 const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX_REQUESTS = 20;
+const RATE_LIMIT_CLEANUP_THRESHOLD = 100;
+
+function cleanupExpiredRateLimits(): void {
+  if (rateLimitMap.size < RATE_LIMIT_CLEANUP_THRESHOLD) {
+    return;
+  }
+  const now = Date.now();
+  for (const [key, value] of rateLimitMap) {
+    if (now > value.resetTime) {
+      rateLimitMap.delete(key);
+    }
+  }
+}
 
 function checkRateLimit(userId: string): boolean {
+  cleanupExpiredRateLimits();
+  
   const now = Date.now();
   const userLimit = rateLimitMap.get(userId);
   
@@ -29,12 +48,6 @@ function checkRateLimit(userId: string): boolean {
   
   userLimit.count++;
   return true;
-}
-
-for (const [key, value] of rateLimitMap) {
-  if (Date.now() > value.resetTime + RATE_LIMIT_WINDOW_MS * 10) {
-    rateLimitMap.delete(key);
-  }
 }
 
 async function verifyAuth(authHeader: string | undefined): Promise<{ userId: string } | null> {
@@ -72,7 +85,12 @@ interface ChatRequestBody {
   pillName?: string;
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+function extractResponseText(response: { text?: string | undefined }): string | null {
+  const text = (response.text ?? '').trim();
+  return text.length > 0 ? text : null;
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse): Promise<VercelResponse> {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -126,7 +144,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         contents: `Provide a brief, one-sentence description for the medication "${pillName}". Do not include any warnings or medical advice. Keep it under 15 words.`,
       });
       
-      return res.status(200).json({ text: response.text.trim() });
+      const text = extractResponseText(response);
+      if (!text) {
+        return res.status(502).json({ error: 'AI returned an empty response. Please try again.' });
+      }
+      
+      return res.status(200).json({ text });
     }
     
     if (body.action === 'chat') {
@@ -154,15 +177,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       
       const model = isThinkingMode ? 'gemini-3.5-flash' : 'gemini-3.5-flash-lite';
       
+      // Use thinkingLevel instead of thinkingBudget for Gemini 3.x models.
+      // For normal mode on flash-lite: minimal (lowest cost).
+      // For thinking mode on flash: medium (balanced) for reasonable cost.
       const config: {
         systemInstruction: string;
-        thinkingConfig?: { thinkingBudget: number };
+        thinkingConfig?: { thinkingLevel: ThinkingLevel };
       } = {
         systemInstruction: "You are a helpful assistant for a pill reminder app named ChronaCare. Provide concise and clear information. Do NOT provide medical advice under any circumstances. If asked for medical advice, gently decline and firmly suggest consulting a healthcare professional. You can answer general knowledge questions about medications, but always preface with a disclaimer that you are not a medical professional."
       };
       
       if (isThinkingMode) {
-        config.thinkingConfig = { thinkingBudget: 32768 };
+        config.thinkingConfig = { thinkingLevel: ThinkingLevel.MEDIUM };
+      } else {
+        config.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
       }
       
       const contents = history.map((msg) => ({
@@ -177,7 +205,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         config: config,
       });
       
-      return res.status(200).json({ text: response.text.trim() });
+      const text = extractResponseText(response);
+      if (!text) {
+        return res.status(502).json({ error: 'AI returned an empty response. Please try again.' });
+      }
+      
+      return res.status(200).json({ text });
     }
     
     return res.status(400).json({ error: 'Invalid action' });

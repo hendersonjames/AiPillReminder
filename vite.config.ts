@@ -2,7 +2,7 @@ import path from 'path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-export default defineConfig(({ mode }) => {
+export default defineConfig(() => {
   return {
     // './' base is required for Capacitor — assets must use relative paths
     // so they resolve correctly inside the native WebView shell
@@ -22,6 +22,10 @@ export default defineConfig(({ mode }) => {
       sourcemap: false,
       // Capacitor WebView works best with these settings
       target: 'es2015',
+      rollupOptions: {
+        // Ensure @google/genai is not bundled into the client (it's server-side only)
+        external: ['@google/genai'],
+      },
     },
   };
 });
