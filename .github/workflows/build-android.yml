@@ -81,6 +81,7 @@ jobs:
       - name: Add Android platform (if not present)
         run: |
           if [ ! -d "android" ]; then
+            npm install @capacitor/android@^7.0.0 --no-save
             npx cap add android
           fi
 
