@@ -1,9 +1,16 @@
 // services/authService.ts
 import { supabase } from '../lib/supabase';
-import { clearUserData } from '../lib/storage';
+import { wipeLocalUserData } from '../lib/storage';
+import { cancelAllScheduledNotifications } from './notificationService';
 import type { User } from '../lib/supabase';
 
 export type { User };
+
+export interface SignOutResult {
+  success: boolean;
+  localOnly: boolean;
+  error?: string;
+}
 
 export const signUp = async (email: string, password: string) => {
   const { data, error } = await supabase.auth.signUp({ email, password });
@@ -26,14 +33,53 @@ export const signInWithGoogle = async () => {
   return data;
 };
 
-// Sign out and clear local health data for the user
-export const signOut = async (userId?: string) => {
-  // Clear local health data before signing out to prevent data leakage
-  if (userId) {
-    clearUserData(userId);
+// Sign out with retry on network failure
+// Always clears local session and user data, even if server revocation fails
+export const signOut = async (userId?: string): Promise<SignOutResult> => {
+  // Cancel native notifications BEFORE anything else
+  // This ensures A's medication names don't keep showing up
+  await cancelAllScheduledNotifications();
+
+  // Try global sign-out (revokes all sessions on server)
+  const { error: globalError } = await supabase.auth.signOut();
+  
+  if (globalError) {
+    // Network failure or server error - fall back to local-only sign-out
+    // This removes the local session so the device is signed out
+    const { error: localError } = await supabase.auth.signOut({ scope: 'local' });
+    
+    // Clear user data AFTER session is removed
+    if (userId) {
+      wipeLocalUserData(userId);
+    }
+    
+    if (localError) {
+      return {
+        success: false,
+        localOnly: true,
+        error: 'Could not sign out. Please try again.',
+      };
+    }
+    
+    return {
+      success: true,
+      localOnly: true,
+      error: 'Signed out on this device; could not reach server to revoke other sessions.',
+    };
   }
-  const { error } = await supabase.auth.signOut();
-  if (error) throw error;
+  
+  // Global sign-out succeeded - clear user data
+  if (userId) {
+    wipeLocalUserData(userId);
+  }
+  
+  return { success: true, localOnly: false };
+};
+
+// Wipe user data without signing out (for SIGNED_OUT events from other sources)
+export const cleanupUserData = async (userId: string): Promise<void> => {
+  await cancelAllScheduledNotifications();
+  wipeLocalUserData(userId);
 };
 
 export const getCurrentUser = async (): Promise<User | null> => {

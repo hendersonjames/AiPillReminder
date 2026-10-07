@@ -6,11 +6,20 @@ import {
   removeLatestTakenEntry,
   enhancePillsWithDerivedStatus,
 } from '../lib/pillHelpers';
+import { getDateString, getTodayDateString, parseLocalDateString } from '../lib/storage';
 import type { Pill, HistoryEntry } from '../types';
+
+// Helper to create a timestamp at a specific hour on a given local date
+const createLocalTimestamp = (dateStr: string, hour: number): number => {
+  const date = parseLocalDateString(dateStr);
+  date.setHours(hour, 30, 0, 0);
+  return date.getTime();
+};
 
 describe('pillHelpers', () => {
   describe('isReminderTakenOnDate', () => {
     it('returns true when there is a taken entry for the specified date', () => {
+      const dateStr = '2024-01-15';
       const history: HistoryEntry[] = [
         {
           id: '1',
@@ -18,11 +27,11 @@ describe('pillHelpers', () => {
           pillName: 'Test Pill',
           time: '09:00',
           action: 'taken',
-          timestamp: new Date('2024-01-15T09:30:00').getTime(),
+          timestamp: createLocalTimestamp(dateStr, 9),
         },
       ];
 
-      expect(isReminderTakenOnDate(history, 'rem-1', '2024-01-15')).toBe(true);
+      expect(isReminderTakenOnDate(history, 'rem-1', dateStr)).toBe(true);
     });
 
     it('returns false when there is no taken entry for the specified date', () => {
@@ -33,7 +42,7 @@ describe('pillHelpers', () => {
           pillName: 'Test Pill',
           time: '09:00',
           action: 'taken',
-          timestamp: new Date('2024-01-14T09:30:00').getTime(),
+          timestamp: createLocalTimestamp('2024-01-14', 9),
         },
       ];
 
@@ -41,6 +50,7 @@ describe('pillHelpers', () => {
     });
 
     it('returns false when the entry is for a different reminder', () => {
+      const dateStr = '2024-01-15';
       const history: HistoryEntry[] = [
         {
           id: '1',
@@ -48,14 +58,15 @@ describe('pillHelpers', () => {
           pillName: 'Test Pill',
           time: '09:00',
           action: 'taken',
-          timestamp: new Date('2024-01-15T09:30:00').getTime(),
+          timestamp: createLocalTimestamp(dateStr, 9),
         },
       ];
 
-      expect(isReminderTakenOnDate(history, 'rem-1', '2024-01-15')).toBe(false);
+      expect(isReminderTakenOnDate(history, 'rem-1', dateStr)).toBe(false);
     });
 
     it('returns false for snoozed or missed entries', () => {
+      const dateStr = '2024-01-15';
       const history: HistoryEntry[] = [
         {
           id: '1',
@@ -63,7 +74,7 @@ describe('pillHelpers', () => {
           pillName: 'Test Pill',
           time: '09:00',
           action: 'snoozed',
-          timestamp: new Date('2024-01-15T09:30:00').getTime(),
+          timestamp: createLocalTimestamp(dateStr, 9),
         },
         {
           id: '2',
@@ -71,17 +82,17 @@ describe('pillHelpers', () => {
           pillName: 'Test Pill',
           time: '09:00',
           action: 'missed',
-          timestamp: new Date('2024-01-15T23:59:00').getTime(),
+          timestamp: createLocalTimestamp(dateStr, 23),
         },
       ];
 
-      expect(isReminderTakenOnDate(history, 'rem-1', '2024-01-15')).toBe(false);
+      expect(isReminderTakenOnDate(history, 'rem-1', dateStr)).toBe(false);
     });
   });
 
   describe('isReminderTakenToday', () => {
-    it('uses current date for the check', () => {
-      const now = new Date();
+    it('returns true when there is a taken entry for today', () => {
+      const todayStr = getTodayDateString();
       const history: HistoryEntry[] = [
         {
           id: '1',
@@ -89,11 +100,30 @@ describe('pillHelpers', () => {
           pillName: 'Test Pill',
           time: '09:00',
           action: 'taken',
-          timestamp: now.getTime(),
+          timestamp: Date.now(),
         },
       ];
 
       expect(isReminderTakenToday(history, 'rem-1')).toBe(true);
+    });
+
+    it('returns false when the entry is from yesterday', () => {
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      yesterday.setHours(12, 0, 0, 0);
+
+      const history: HistoryEntry[] = [
+        {
+          id: '1',
+          reminderId: 'rem-1',
+          pillName: 'Test Pill',
+          time: '09:00',
+          action: 'taken',
+          timestamp: yesterday.getTime(),
+        },
+      ];
+
+      expect(isReminderTakenToday(history, 'rem-1')).toBe(false);
     });
   });
 
@@ -111,24 +141,23 @@ describe('pillHelpers', () => {
         { id: 'r1', time: '09:00', daysOfWeek: [0, 1, 2, 3, 4, 5, 6], taken: false },
       ]);
 
-      // Mock: last sweep was 3 days ago
+      // Last sweep was 3 days ago
       const threeDaysAgo = new Date();
       threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
-      const lastSweepStr = threeDaysAgo.toISOString().split('T')[0];
+      const lastSweepStr = getDateString(threeDaysAgo);
 
       const result = recordMissedDoses([pill], lastSweepStr);
 
       // Should have missed entries for the 2 days between sweep and yesterday
       expect(result.hasChanges).toBe(true);
       const missedEntries = result.updatedPills[0].history?.filter(h => h.action === 'missed') || [];
-      expect(missedEntries.length).toBe(2); // 2 days: day before yesterday and yesterday
+      expect(missedEntries.length).toBe(2);
     });
 
     it('does not record missed doses if already logged', () => {
       const twoDaysAgo = new Date();
       twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
-      const twoDaysAgoEnd = new Date(twoDaysAgo);
-      twoDaysAgoEnd.setHours(23, 59, 59, 999);
+      twoDaysAgo.setHours(12, 0, 0, 0);
 
       const pill = createPill(
         'p1',
@@ -141,14 +170,14 @@ describe('pillHelpers', () => {
             pillName: 'Vitamin D',
             time: '09:00',
             action: 'taken',
-            timestamp: twoDaysAgoEnd.getTime(),
+            timestamp: twoDaysAgo.getTime(),
           },
         ]
       );
 
       const threeDaysAgo = new Date();
       threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
-      const lastSweepStr = threeDaysAgo.toISOString().split('T')[0];
+      const lastSweepStr = getDateString(threeDaysAgo);
 
       const result = recordMissedDoses([pill], lastSweepStr);
 
@@ -166,14 +195,12 @@ describe('pillHelpers', () => {
       // Last sweep was a week ago
       const weekAgo = new Date();
       weekAgo.setDate(weekAgo.getDate() - 7);
-      const lastSweepStr = weekAgo.toISOString().split('T')[0];
+      const lastSweepStr = getDateString(weekAgo);
 
       const result = recordMissedDoses([pill], lastSweepStr);
 
-      // Count missed entries - should be approximately 5 (weekdays only)
-      const missedEntries = result.updatedPills[0].history?.filter(h => h.action === 'missed') || [];
-      
       // Verify all missed entries are for weekdays
+      const missedEntries = result.updatedPills[0].history?.filter(h => h.action === 'missed') || [];
       missedEntries.forEach(entry => {
         const date = new Date(entry.timestamp);
         const dayOfWeek = date.getDay();
@@ -188,7 +215,7 @@ describe('pillHelpers', () => {
 
       const yesterday = new Date();
       yesterday.setDate(yesterday.getDate() - 1);
-      const yesterdayStr = yesterday.toISOString().split('T')[0];
+      const yesterdayStr = getDateString(yesterday);
 
       const result = recordMissedDoses([pill], yesterdayStr);
 
@@ -211,9 +238,8 @@ describe('pillHelpers', () => {
 
   describe('removeLatestTakenEntry', () => {
     it('removes only the most recent taken entry for today', () => {
-      const now = new Date();
-      const today = now.toISOString().split('T')[0];
-      const dayStart = new Date(today + 'T00:00:00').getTime();
+      const todayStr = getTodayDateString();
+      const dayStart = parseLocalDateString(todayStr).getTime();
 
       const history: HistoryEntry[] = [
         {
@@ -222,7 +248,7 @@ describe('pillHelpers', () => {
           pillName: 'Test',
           time: '09:00',
           action: 'taken',
-          timestamp: dayStart + 3600000, // 1am
+          timestamp: dayStart + 3600000, // 1 hour after midnight
         },
         {
           id: '2',
@@ -230,7 +256,7 @@ describe('pillHelpers', () => {
           pillName: 'Test',
           time: '09:00',
           action: 'taken',
-          timestamp: dayStart + 7200000, // 2am
+          timestamp: dayStart + 7200000, // 2 hours after midnight
         },
       ];
 
@@ -243,6 +269,7 @@ describe('pillHelpers', () => {
     it('does not remove entries from other days', () => {
       const yesterday = new Date();
       yesterday.setDate(yesterday.getDate() - 1);
+      yesterday.setHours(12, 0, 0, 0);
 
       const history: HistoryEntry[] = [
         {

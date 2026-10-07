@@ -9,9 +9,12 @@ import {
   hasPendingSync,
   setPendingSync,
   clearUserData,
-  migrateUnscopedData,
+  wipeLocalUserData,
+  purgeLegacyUnscopedData,
   getTodayDateString,
   getDateString,
+  getLocalDateString,
+  parseLocalDateString,
 } from '../lib/storage';
 import type { Pill } from '../types';
 
@@ -64,6 +67,55 @@ describe('storage', () => {
     });
   });
 
+  describe('purgeLegacyUnscopedData', () => {
+    it('removes legacy unscoped keys', () => {
+      // Set up legacy data
+      localStorage.setItem('pills', JSON.stringify([createTestPill('old', 'Old Pill')]));
+      localStorage.setItem('remedi_last_missed_sweep', '2024-01-15');
+
+      purgeLegacyUnscopedData();
+
+      // Legacy keys should be removed
+      expect(localStorage.getItem('pills')).toBeNull();
+      expect(localStorage.getItem('remedi_last_missed_sweep')).toBeNull();
+    });
+
+    it('does not affect user-scoped keys', () => {
+      const userPills = [createTestPill('1', 'User Pill')];
+      savePillsToStorage(testUserId, userPills);
+      setLastMissedSweepDate(testUserId, '2024-01-15');
+
+      // Also set legacy keys
+      localStorage.setItem('pills', JSON.stringify([createTestPill('old', 'Old Pill')]));
+
+      purgeLegacyUnscopedData();
+
+      // User-scoped data should be preserved
+      expect(loadPillsFromStorage(testUserId)).toEqual(userPills);
+      expect(getLastMissedSweepDate(testUserId)).toBe('2024-01-15');
+      
+      // Legacy should be gone
+      expect(localStorage.getItem('pills')).toBeNull();
+    });
+  });
+
+  describe('legacy keys are never migrated or shown (security fix M1)', () => {
+    it('legacy unscoped pills are deleted, not migrated to any user', () => {
+      const legacyPills = [createTestPill('old', 'Previous User Pill')];
+      localStorage.setItem('pills', JSON.stringify(legacyPills));
+
+      // Purge at startup (as done in App.tsx)
+      purgeLegacyUnscopedData();
+
+      // User B signs in - should get empty, not legacy data
+      const userBPills = loadPillsFromStorage(otherUserId);
+      expect(userBPills).toEqual([]);
+
+      // Legacy key should be gone
+      expect(localStorage.getItem('pills')).toBeNull();
+    });
+  });
+
   describe('clearUserData', () => {
     it('removes all user-scoped data', () => {
       savePillsToStorage(testUserId, [createTestPill('1', 'Test')]);
@@ -77,6 +129,18 @@ describe('storage', () => {
       expect(getLastMissedSweepDate(testUserId)).toBeNull();
       expect(hasPendingSync(testUserId)).toBe(false);
       expect(loadCloudIdsFromStorage(testUserId)).toEqual(new Set());
+    });
+  });
+
+  describe('wipeLocalUserData', () => {
+    it('clears user data and legacy keys', () => {
+      savePillsToStorage(testUserId, [createTestPill('1', 'Test')]);
+      localStorage.setItem('pills', JSON.stringify([createTestPill('old', 'Old')]));
+
+      wipeLocalUserData(testUserId);
+
+      expect(loadPillsFromStorage(testUserId)).toEqual([]);
+      expect(localStorage.getItem('pills')).toBeNull();
     });
   });
 
@@ -106,54 +170,67 @@ describe('storage', () => {
     });
   });
 
-  describe('migrateUnscopedData', () => {
-    it('migrates old unscoped pills to user-scoped storage', () => {
-      const oldPills = [createTestPill('1', 'Old Pill')];
-      localStorage.setItem('pills', JSON.stringify(oldPills));
-      localStorage.setItem('remedi_last_missed_sweep', '2024-01-15');
+  describe('old sweep date format handling (N3)', () => {
+    it('converts old toDateString format to YYYY-MM-DD', () => {
+      // Old format from previous version
+      localStorage.setItem(`remedi_last_missed_sweep_${testUserId}`, 'Mon Oct 05 2026');
 
-      const migrated = migrateUnscopedData(testUserId);
+      const result = getLastMissedSweepDate(testUserId);
 
-      expect(migrated).toEqual(oldPills);
-      expect(loadPillsFromStorage(testUserId)).toEqual(oldPills);
-      expect(getLastMissedSweepDate(testUserId)).toBe('2024-01-15');
-
-      // Old keys should be removed
-      expect(localStorage.getItem('pills')).toBeNull();
-      expect(localStorage.getItem('remedi_last_missed_sweep')).toBeNull();
-    });
-
-    it('does not overwrite existing user data', () => {
-      const existingPills = [createTestPill('1', 'Existing Pill')];
-      const oldPills = [createTestPill('2', 'Old Pill')];
-
-      savePillsToStorage(testUserId, existingPills);
-      localStorage.setItem('pills', JSON.stringify(oldPills));
-
-      const migrated = migrateUnscopedData(testUserId);
-
-      expect(migrated).toBeNull();
-      expect(loadPillsFromStorage(testUserId)).toEqual(existingPills);
-
-      // Old keys should still be removed
-      expect(localStorage.getItem('pills')).toBeNull();
-    });
-
-    it('returns null when there is no unscoped data', () => {
-      const migrated = migrateUnscopedData(testUserId);
-      expect(migrated).toBeNull();
-    });
-  });
-
-  describe('date helpers', () => {
-    it('getTodayDateString returns YYYY-MM-DD format', () => {
-      const result = getTodayDateString();
+      // Should be converted to new format
       expect(result).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     });
 
-    it('getDateString returns YYYY-MM-DD format for any date', () => {
-      const date = new Date('2024-01-15T10:30:00');
+    it('preserves new YYYY-MM-DD format', () => {
+      setLastMissedSweepDate(testUserId, '2024-01-15');
+
+      const result = getLastMissedSweepDate(testUserId);
+      expect(result).toBe('2024-01-15');
+    });
+  });
+
+  describe('date helpers (timezone-independent)', () => {
+    it('getTodayDateString returns YYYY-MM-DD format using local date', () => {
+      const result = getTodayDateString();
+      expect(result).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      
+      // Verify it matches local date
+      const now = new Date();
+      const expected = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+      expect(result).toBe(expected);
+    });
+
+    it('getDateString returns YYYY-MM-DD format for any date using local calendar', () => {
+      // Create a date at noon to avoid any edge cases
+      const date = new Date(2024, 0, 15, 12, 0, 0); // Jan 15, 2024 noon local
       expect(getDateString(date)).toBe('2024-01-15');
+    });
+
+    it('getLocalDateString uses local calendar components', () => {
+      const date = new Date(2024, 5, 20, 12, 0, 0); // June 20, 2024 noon local
+      expect(getLocalDateString(date)).toBe('2024-06-20');
+    });
+
+    it('parseLocalDateString creates local midnight', () => {
+      const parsed = parseLocalDateString('2024-01-15');
+      
+      expect(parsed.getFullYear()).toBe(2024);
+      expect(parsed.getMonth()).toBe(0); // January
+      expect(parsed.getDate()).toBe(15);
+      expect(parsed.getHours()).toBe(0);
+      expect(parsed.getMinutes()).toBe(0);
+    });
+
+    it('round-trips date through getDateString and parseLocalDateString', () => {
+      const original = new Date();
+      original.setHours(12, 0, 0, 0); // Noon to avoid edge cases
+      
+      const dateStr = getDateString(original);
+      const parsed = parseLocalDateString(dateStr);
+      
+      expect(parsed.getFullYear()).toBe(original.getFullYear());
+      expect(parsed.getMonth()).toBe(original.getMonth());
+      expect(parsed.getDate()).toBe(original.getDate());
     });
   });
 });

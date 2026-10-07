@@ -6,6 +6,7 @@ vi.mock('../lib/supabase', () => ({
   supabase: {
     auth: {
       getUser: vi.fn(),
+      getSession: vi.fn(),
     },
     from: vi.fn(),
   },
@@ -15,7 +16,8 @@ import { supabase } from '../lib/supabase';
 import { loadPillsFromCloud, syncPillsToCloud, savePillToCloud, deletePillFromCloud } from '../services/pillsService';
 
 describe('pillsService', () => {
-  const mockUser = { id: 'user-123' };
+  const mockUserId = 'user-123';
+  const mockUser = { id: mockUserId };
 
   const createTestPill = (id: string, name: string): Pill => ({
     id,
@@ -32,8 +34,8 @@ describe('pillsService', () => {
   describe('loadPillsFromCloud', () => {
     it('loads and transforms pills from database', async () => {
       const dbRows = [
-        { id: 'p1', user_id: mockUser.id, pill_name: 'Vitamin D', pill_data: { name: 'Vitamin D', dosage: '1000IU' }, created_at: '2024-01-01' },
-        { id: 'p2', user_id: mockUser.id, pill_name: 'Aspirin', pill_data: { name: 'Aspirin', dosage: '81mg' }, created_at: '2024-01-02' },
+        { id: 'p1', user_id: mockUserId, pill_name: 'Vitamin D', pill_data: { name: 'Vitamin D', dosage: '1000IU' }, created_at: '2024-01-01' },
+        { id: 'p2', user_id: mockUserId, pill_name: 'Aspirin', pill_data: { name: 'Aspirin', dosage: '81mg' }, created_at: '2024-01-02' },
       ];
 
       const mockSelect = vi.fn().mockReturnThis();
@@ -71,8 +73,8 @@ describe('pillsService', () => {
 
   describe('syncPillsToCloud', () => {
     beforeEach(() => {
-      vi.mocked(supabase.auth.getUser).mockResolvedValue({
-        data: { user: mockUser as any },
+      vi.mocked(supabase.auth.getSession).mockResolvedValue({
+        data: { session: { user: mockUser } as any },
         error: null,
       });
     });
@@ -93,23 +95,60 @@ describe('pillsService', () => {
 
       deleteFn.mockReturnValue({ eq: eqFn });
 
-      const result = await syncPillsToCloud(localPills, existingCloudIds);
+      const result = await syncPillsToCloud(mockUserId, localPills, existingCloudIds);
 
       expect(result.success).toBe(true);
       expect(upsertFn).toHaveBeenCalledTimes(2); // 2 pills to upsert
       expect(deleteFn).toHaveBeenCalled(); // p2 should be deleted
     });
 
-    it('returns error when not authenticated', async () => {
-      vi.mocked(supabase.auth.getUser).mockResolvedValue({
-        data: { user: null },
+    it('aborts and returns error when user changes during sync (S4)', async () => {
+      const differentUser = { id: 'different-user-456' };
+      
+      // First call returns expected user, subsequent calls return different user
+      let callCount = 0;
+      vi.mocked(supabase.auth.getSession).mockImplementation(async () => {
+        callCount++;
+        if (callCount === 1) {
+          return { data: { session: { user: mockUser } as any }, error: null };
+        }
+        return { data: { session: { user: differentUser } as any }, error: null };
+      });
+
+      const upsertFn = vi.fn().mockResolvedValue({ error: null });
+      vi.mocked(supabase.from).mockImplementation((table: string) => ({
+        upsert: upsertFn,
+      } as any));
+
+      const result = await syncPillsToCloud(mockUserId, [createTestPill('p1', 'Test')], new Set());
+
+      expect(result.success).toBe(false);
+      expect(result.aborted).toBe(true);
+      expect(result.error).toContain('User changed');
+    });
+
+    it('returns error when session user does not match expected user', async () => {
+      vi.mocked(supabase.auth.getSession).mockResolvedValue({
+        data: { session: { user: { id: 'wrong-user' } } as any },
         error: null,
       });
 
-      const result = await syncPillsToCloud([createTestPill('p1', 'Test')], new Set());
+      const result = await syncPillsToCloud(mockUserId, [createTestPill('p1', 'Test')], new Set());
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('Not authenticated');
+      expect(result.aborted).toBe(true);
+    });
+
+    it('returns error when not authenticated (no session)', async () => {
+      vi.mocked(supabase.auth.getSession).mockResolvedValue({
+        data: { session: null },
+        error: null,
+      });
+
+      const result = await syncPillsToCloud(mockUserId, [createTestPill('p1', 'Test')], new Set());
+
+      expect(result.success).toBe(false);
+      expect(result.aborted).toBe(true);
     });
 
     it('collects errors from failed operations', async () => {
@@ -121,7 +160,7 @@ describe('pillsService', () => {
         upsert: upsertFn,
       } as any));
 
-      const result = await syncPillsToCloud(localPills, new Set());
+      const result = await syncPillsToCloud(mockUserId, localPills, new Set());
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Upsert failed');
@@ -129,9 +168,9 @@ describe('pillsService', () => {
   });
 
   describe('savePillToCloud', () => {
-    it('upserts a single pill', async () => {
-      vi.mocked(supabase.auth.getUser).mockResolvedValue({
-        data: { user: mockUser as any },
+    it('upserts a single pill with user verification', async () => {
+      vi.mocked(supabase.auth.getSession).mockResolvedValue({
+        data: { session: { user: mockUser } as any },
         error: null,
       });
 
@@ -142,22 +181,40 @@ describe('pillsService', () => {
       } as any);
 
       const pill = createTestPill('p1', 'Test Pill');
-      const result = await savePillToCloud(pill);
+      const result = await savePillToCloud(pill, mockUserId);
 
       expect(result.success).toBe(true);
       expect(upsertFn).toHaveBeenCalledWith(
         expect.objectContaining({
           id: 'p1',
-          user_id: mockUser.id,
+          user_id: mockUserId,
           pill_name: 'Test Pill',
         }),
         expect.objectContaining({ onConflict: 'id' })
       );
     });
+
+    it('aborts if user changed', async () => {
+      vi.mocked(supabase.auth.getSession).mockResolvedValue({
+        data: { session: { user: { id: 'wrong-user' } } as any },
+        error: null,
+      });
+
+      const pill = createTestPill('p1', 'Test Pill');
+      const result = await savePillToCloud(pill, mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.aborted).toBe(true);
+    });
   });
 
   describe('deletePillFromCloud', () => {
-    it('deletes a pill by ID', async () => {
+    it('deletes a pill by ID with user verification', async () => {
+      vi.mocked(supabase.auth.getSession).mockResolvedValue({
+        data: { session: { user: mockUser } as any },
+        error: null,
+      });
+
       const deleteFn = vi.fn().mockReturnThis();
       const eqFn = vi.fn().mockResolvedValue({ error: null });
 
@@ -167,7 +224,7 @@ describe('pillsService', () => {
 
       deleteFn.mockReturnValue({ eq: eqFn });
 
-      const result = await deletePillFromCloud('p1');
+      const result = await deletePillFromCloud('p1', mockUserId);
 
       expect(result.success).toBe(true);
       expect(deleteFn).toHaveBeenCalled();
@@ -175,6 +232,11 @@ describe('pillsService', () => {
     });
 
     it('returns error on deletion failure', async () => {
+      vi.mocked(supabase.auth.getSession).mockResolvedValue({
+        data: { session: { user: mockUser } as any },
+        error: null,
+      });
+
       const deleteFn = vi.fn().mockReturnThis();
       const eqFn = vi.fn().mockResolvedValue({ error: { message: 'Delete failed' } });
 
@@ -184,7 +246,7 @@ describe('pillsService', () => {
 
       deleteFn.mockReturnValue({ eq: eqFn });
 
-      const result = await deletePillFromCloud('p1');
+      const result = await deletePillFromCloud('p1', mockUserId);
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('Delete failed');

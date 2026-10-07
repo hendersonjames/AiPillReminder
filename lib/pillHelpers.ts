@@ -2,7 +2,7 @@
 // Helper functions for pill status derivation and missed dose handling
 
 import type { Pill, Reminder, HistoryEntry } from '../types';
-import { getDateString, getTodayDateString } from './storage';
+import { getDateString, getTodayDateString, parseLocalDateString } from './storage';
 
 // ─── Derive "taken today" from history ────────────────────────────────────────
 // Instead of storing a `taken` flag that can become stale,
@@ -13,7 +13,7 @@ export const isReminderTakenOnDate = (
   reminderId: string,
   dateStr: string
 ): boolean => {
-  const targetDate = new Date(dateStr + 'T00:00:00');
+  const targetDate = parseLocalDateString(dateStr);
   const dayStart = targetDate.getTime();
   const dayEnd = dayStart + 86400000 - 1;
 
@@ -66,7 +66,7 @@ export const recordMissedDoses = (
   
   if (lastSweepDateStr) {
     // Start from the day after the last sweep
-    sweepStartDate = new Date(lastSweepDateStr + 'T00:00:00');
+    sweepStartDate = parseLocalDateString(lastSweepDateStr);
     sweepStartDate.setDate(sweepStartDate.getDate() + 1);
   } else {
     // If never swept, just do yesterday
@@ -136,7 +136,7 @@ export const removeLatestTakenEntry = (
   reminderId: string
 ): HistoryEntry[] => {
   const todayStr = getTodayDateString();
-  const today = new Date(todayStr + 'T00:00:00');
+  const today = parseLocalDateString(todayStr);
   const dayStart = today.getTime();
   const dayEnd = dayStart + 86400000 - 1;
 

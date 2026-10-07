@@ -8,8 +8,25 @@ const LAST_SWEEP_KEY_PREFIX = 'remedi_last_missed_sweep_';
 const PENDING_SYNC_KEY_PREFIX = 'remedi_pending_sync_';
 const CLOUD_IDS_KEY_PREFIX = 'remedi_cloud_ids_';
 
+// Legacy unscoped keys that must be purged (from pre-fix versions)
+const LEGACY_UNSCOPED_KEYS = ['pills', 'remedi_last_missed_sweep'];
+
 // Get user-scoped storage key
 const getUserKey = (prefix: string, userId: string): string => `${prefix}${userId}`;
+
+// ─── Purge legacy unscoped data (call at startup, before auth) ────────────────
+// These keys have no owner and could belong to anyone who used the device.
+// Delete them unconditionally to prevent data leakage.
+
+export const purgeLegacyUnscopedData = (): void => {
+  LEGACY_UNSCOPED_KEYS.forEach(key => {
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // Ignore errors - best effort cleanup
+    }
+  });
+};
 
 // ─── Pills storage ────────────────────────────────────────────────────────────
 
@@ -63,7 +80,28 @@ export const saveCloudIdsToStorage = (userId: string, ids: Set<string>): void =>
 
 export const getLastMissedSweepDate = (userId: string): string | null => {
   const key = getUserKey(LAST_SWEEP_KEY_PREFIX, userId);
-  return localStorage.getItem(key);
+  const value = localStorage.getItem(key);
+  
+  // Handle old format (e.g. "Mon Oct 05 2026" from toDateString())
+  // vs new format ("2026-10-05" YYYY-MM-DD)
+  if (value && !value.match(/^\d{4}-\d{2}-\d{2}$/)) {
+    // Old format - try to parse it
+    try {
+      const parsed = new Date(value);
+      if (!isNaN(parsed.getTime())) {
+        // Convert to new format
+        const newFormat = getLocalDateString(parsed);
+        localStorage.setItem(key, newFormat);
+        return newFormat;
+      }
+    } catch {
+      // Invalid date - clear it
+      localStorage.removeItem(key);
+      return null;
+    }
+  }
+  
+  return value;
 };
 
 export const setLastMissedSweepDate = (userId: string, dateStr: string): void => {
@@ -106,55 +144,35 @@ export const clearUserData = (userId: string): void => {
   });
 };
 
-// ─── Migration: move old unscoped data to user-scoped ─────────────────────────
+// ─── Comprehensive wipe: user data + legacy keys ──────────────────────────────
+// Call this on sign-out to ensure complete cleanup
 
-export const migrateUnscopedData = (userId: string): Pill[] | null => {
-  try {
-    // Check for old unscoped pills
-    const oldPills = localStorage.getItem('pills');
-    const oldSweep = localStorage.getItem('remedi_last_missed_sweep');
-    
-    if (oldPills) {
-      const pills = JSON.parse(oldPills) as Pill[];
-      
-      // Only migrate if current user has no data
-      const existingUserPills = loadPillsFromStorage(userId);
-      if (existingUserPills.length === 0 && pills.length > 0) {
-        // Migrate to user-scoped storage
-        savePillsToStorage(userId, pills);
-        
-        // Migrate sweep date if exists
-        if (oldSweep) {
-          setLastMissedSweepDate(userId, oldSweep);
-        }
-        
-        // Clean up old keys
-        localStorage.removeItem('pills');
-        localStorage.removeItem('remedi_last_missed_sweep');
-        
-        return pills;
-      }
-      
-      // Clean up old keys even if we didn't migrate (user has data already)
-      localStorage.removeItem('pills');
-      localStorage.removeItem('remedi_last_missed_sweep');
-    }
-  } catch (error) {
-    console.error('Failed to migrate unscoped data', error);
-  }
-  return null;
+export const wipeLocalUserData = (userId: string): void => {
+  // Clear user-scoped data
+  clearUserData(userId);
+  // Also purge any legacy keys that might have appeared
+  purgeLegacyUnscopedData();
 };
 
-// ─── Get today's date string for taken status derivation ──────────────────────
+// ─── Date helpers using LOCAL calendar date (not UTC) ─────────────────────────
+
+export const getLocalDateString = (date: Date): string => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
 
 export const getTodayDateString = (): string => {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  return today.toISOString().split('T')[0]; // YYYY-MM-DD
+  return getLocalDateString(new Date());
 };
 
 export const getDateString = (date: Date): string => {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return d.toISOString().split('T')[0]; // YYYY-MM-DD
+  return getLocalDateString(date);
+};
+
+// Parse a YYYY-MM-DD string as local midnight
+export const parseLocalDateString = (dateStr: string): Date => {
+  const [year, month, day] = dateStr.split('-').map(Number);
+  return new Date(year, month - 1, day, 0, 0, 0, 0);
 };

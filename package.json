@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:tz": "TZ=UTC vitest run && TZ=America/Denver vitest run && TZ=Asia/Tokyo vitest run",
     "cap:sync": "vite build && npx cap sync",
     "cap:android": "vite build && npx cap sync && npx cap open android",
     "cap:ios": "vite build && npx cap sync && npx cap open ios"

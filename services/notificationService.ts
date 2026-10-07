@@ -225,6 +225,57 @@ export const cancelAllPillNotifications = async (
   }
 };
 
+// ─── Cancel ALL scheduled notifications (for sign-out) ───────────────────────
+// Removes all pending and delivered notifications to prevent data leakage
+
+export const cancelAllScheduledNotifications = async (): Promise<void> => {
+  if (!isNative()) return;
+
+  await loadNativePlugins();
+
+  try {
+    // Cancel all pending notifications
+    const { notifications } = await LocalNotifications.getPending();
+    if (notifications && notifications.length > 0) {
+      await LocalNotifications.cancel({
+        notifications: notifications.map((n: any) => ({ id: n.id })),
+      });
+    }
+
+    // Remove all delivered notifications from notification center
+    await LocalNotifications.removeAllDeliveredNotifications();
+  } catch (err) {
+    console.warn('Failed to cancel all notifications:', err);
+  }
+};
+
+// ─── Schedule all notifications from a list of pills ──────────────────────────
+// Used after cloud load to ensure notifications match the user's pills
+
+export const scheduleAllPillNotifications = async (
+  pills: Array<{
+    id: string;
+    name: string;
+    dosage: string;
+    reminders: Array<{ id: string; time: string; daysOfWeek: number[] }>;
+  }>
+): Promise<void> => {
+  if (!isNative()) return;
+
+  for (const pill of pills) {
+    for (const reminder of pill.reminders) {
+      await scheduleReminderNotifications(
+        pill.id,
+        pill.name,
+        pill.dosage,
+        reminder.id,
+        reminder.time,
+        reminder.daysOfWeek
+      );
+    }
+  }
+};
+
 // ─── Register notification action handlers ────────────────────────────────────
 //
 // Set up listeners for when a user taps a notification.
