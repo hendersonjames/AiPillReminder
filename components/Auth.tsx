@@ -33,6 +33,9 @@ const Auth: React.FC = () => {
           <ul className="bg-red-50 rounded-lg p-4 text-sm font-mono text-red-700 space-y-1 mb-4">
             <li>VITE_SUPABASE_URL</li>
             <li>VITE_SUPABASE_PUBLISHABLE_KEY</li>
+          </ul>
+          <p className="text-slate-500 text-xs mb-2">Optional (for AI features):</p>
+          <ul className="bg-amber-50 rounded-lg p-4 text-sm font-mono text-amber-700 space-y-1 mb-4">
             <li>GEMINI_API_KEY</li>
           </ul>
           <p className="text-slate-500 text-xs">Add these in your Vercel project → Settings → Environment Variables, then redeploy.</p>

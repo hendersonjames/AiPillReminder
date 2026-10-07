@@ -1,19 +1,31 @@
 import { GoogleGenAI } from "@google/genai";
 import { ChatMessage, MessageAuthor } from "../types";
 
-const API_KEY = process.env.API_KEY;
+const API_KEY = import.meta.env.GEMINI_API_KEY;
 
-if (!API_KEY) {
-  throw new Error("API_KEY environment variable is not set");
-}
+let ai: GoogleGenAI | null = null;
 
-const ai = new GoogleGenAI({ apiKey: API_KEY });
+const getAI = (): GoogleGenAI | null => {
+  if (!API_KEY) return null;
+  if (!ai) {
+    ai = new GoogleGenAI({ apiKey: API_KEY });
+  }
+  return ai;
+};
+
+export const isGeminiConfigured = (): boolean => Boolean(API_KEY);
 
 export const getQuickSuggestion = async (pillName: string): Promise<string> => {
   if (!pillName.trim()) return "";
+  
+  const client = getAI();
+  if (!client) {
+    return "AI suggestions unavailable (API key not configured)";
+  }
+  
   try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-flash-lite-latest',
+    const response = await client.models.generateContent({
+      model: 'gemini-3.5-flash-lite',
       contents: `Provide a brief, one-sentence description for the medication "${pillName}". Do not include any warnings or medical advice. Keep it under 15 words.`,
     });
     return response.text.trim();
@@ -28,8 +40,13 @@ export const getChatResponse = async (
   newMessage: string,
   isThinkingMode: boolean
 ): Promise<string> => {
+  const client = getAI();
+  if (!client) {
+    return "AI chat is unavailable. Please configure the GEMINI_API_KEY environment variable to enable AI features.";
+  }
+  
   try {
-    const model = isThinkingMode ? 'gemini-2.5-pro' : 'gemini-2.5-flash';
+    const model = isThinkingMode ? 'gemini-3.5-flash' : 'gemini-3.5-flash-lite';
     
     const config: {
       systemInstruction: string;
@@ -48,7 +65,7 @@ export const getChatResponse = async (
     }));
     contents.push({ role: 'user', parts: [{ text: newMessage }] });
 
-    const response = await ai.models.generateContent({
+    const response = await client.models.generateContent({
         model: model,
         contents: contents,
         config: config,
