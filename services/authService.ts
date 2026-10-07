@@ -1,5 +1,6 @@
 // services/authService.ts
 import { supabase } from '../lib/supabase';
+import { clearUserData } from '../lib/storage';
 import type { User } from '../lib/supabase';
 
 export type { User };
@@ -25,13 +26,23 @@ export const signInWithGoogle = async () => {
   return data;
 };
 
-export const signOut = async () => {
+// Sign out and clear local health data for the user
+export const signOut = async (userId?: string) => {
+  // Clear local health data before signing out to prevent data leakage
+  if (userId) {
+    clearUserData(userId);
+  }
   const { error } = await supabase.auth.signOut();
   if (error) throw error;
 };
 
-export const onAuthStateChange = (callback: (user: User | null) => void) => {
-  return supabase.auth.onAuthStateChange((_event, session) => {
-    callback(session?.user ?? null);
+export const getCurrentUser = async (): Promise<User | null> => {
+  const { data: { user } } = await supabase.auth.getUser();
+  return user;
+};
+
+export const onAuthStateChange = (callback: (user: User | null, event: string) => void) => {
+  return supabase.auth.onAuthStateChange((event, session) => {
+    callback(session?.user ?? null, event);
   });
 };
