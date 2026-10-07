@@ -117,12 +117,18 @@ const AddPillModal: React.FC<AddPillModalProps> = ({ onClose, onSavePill, pillTo
         dosage,
         notes,
         notificationSound,
-        reminders: reminders.map(r => ({
-          id: r.id || Math.random().toString(), // Preserve existing ID or generate new one
-          time: r.time,
-          daysOfWeek: r.daysOfWeek,
-          taken: false,
-        })),
+        reminders: reminders.map(r => {
+          // When editing, preserve existing reminder state where IDs match
+          const existingReminder = pillToEdit?.reminders.find(er => er.id === r.id);
+          return {
+            id: r.id || Math.random().toString(),
+            time: r.time,
+            daysOfWeek: r.daysOfWeek,
+            // Preserve taken and snoozedUntil from existing reminder if editing
+            taken: existingReminder?.taken ?? false,
+            snoozedUntil: existingReminder?.snoozedUntil,
+          };
+        }),
       };
 
       if (isEditMode && pillToEdit) {

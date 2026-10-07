@@ -1,8 +1,14 @@
 // services/pillsService.ts
-// Syncs pills to Supabase cloud database
+// Syncs pills to Supabase cloud database - non-destructive sync with error handling
 
 import { supabase } from '../lib/supabase';
 import type { Pill } from '../types';
+
+export interface SyncResult {
+  success: boolean;
+  error?: string;
+  aborted?: boolean;
+}
 
 // Load all pills for the current user from Supabase
 export const loadPillsFromCloud = async (): Promise<Pill[]> => {
@@ -20,46 +26,101 @@ export const loadPillsFromCloud = async (): Promise<Pill[]> => {
   }));
 };
 
-// Save all pills (full sync) to Supabase
-export const syncPillsToCloud = async (pills: Pill[]): Promise<void> => {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return;
-
-  // Delete all existing pills and re-insert
-  // Simple approach — good for small datasets like pill lists
-  await supabase.from('pills').delete().eq('user_id', user.id);
-
-  if (pills.length === 0) return;
-
-  const rows = pills.map(pill => ({
-    id: pill.id,
-    user_id: user.id,
-    pill_name: pill.name,
-    pill_data: pill, // Store full pill object as JSON
-    created_at: new Date().toISOString(),
-  }));
-
-  const { error } = await supabase.from('pills').insert(rows);
-  if (error) throw error;
+// Verify that the current session user matches the expected user
+// Returns the verified user or null if mismatch/no session
+const verifySessionUser = async (expectedUserId: string): Promise<boolean> => {
+  const { data: { session } } = await supabase.auth.getSession();
+  return session?.user?.id === expectedUserId;
 };
 
-// Save a single new pill
-export const savePillToCloud = async (pill: Pill): Promise<void> => {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return;
+// Sync pills to cloud using per-record upsert/delete (non-destructive)
+// Only syncs the delta - inserts new, updates changed, deletes removed
+// Aborts if the session user doesn't match expectedUserId
+export const syncPillsToCloud = async (
+  expectedUserId: string,
+  pills: Pill[],
+  existingCloudIds: Set<string>
+): Promise<SyncResult> => {
+  // Verify user before starting
+  if (!await verifySessionUser(expectedUserId)) {
+    return { success: false, error: 'User changed during sync', aborted: true };
+  }
+
+  const localIds = new Set(pills.map(p => p.id));
+  const errors: string[] = [];
+
+  // Upsert all local pills (insert or update)
+  for (const pill of pills) {
+    // Re-verify user before each operation to catch mid-sync changes
+    if (!await verifySessionUser(expectedUserId)) {
+      return { success: false, error: 'User changed during sync', aborted: true };
+    }
+
+    const { error } = await supabase.from('pills').upsert({
+      id: pill.id,
+      user_id: expectedUserId,
+      pill_name: pill.name,
+      pill_data: pill,
+    }, {
+      onConflict: 'id',
+    });
+
+    if (error) {
+      errors.push(`Failed to save ${pill.name}: ${error.message}`);
+    }
+  }
+
+  // Delete pills that exist in cloud but not locally (user deleted them)
+  const idsToDelete = [...existingCloudIds].filter(id => !localIds.has(id));
+  for (const id of idsToDelete) {
+    // Re-verify user before delete
+    if (!await verifySessionUser(expectedUserId)) {
+      return { success: false, error: 'User changed during sync', aborted: true };
+    }
+
+    const { error } = await supabase.from('pills').delete().eq('id', id);
+    if (error) {
+      errors.push(`Failed to delete pill ${id}: ${error.message}`);
+    }
+  }
+
+  if (errors.length > 0) {
+    return { success: false, error: errors.join('; ') };
+  }
+
+  return { success: true };
+};
+
+// Save a single pill (upsert)
+export const savePillToCloud = async (pill: Pill, expectedUserId: string): Promise<SyncResult> => {
+  if (!await verifySessionUser(expectedUserId)) {
+    return { success: false, error: 'User changed', aborted: true };
+  }
 
   const { error } = await supabase.from('pills').upsert({
     id: pill.id,
-    user_id: user.id,
+    user_id: expectedUserId,
     pill_name: pill.name,
     pill_data: pill,
+  }, {
+    onConflict: 'id',
   });
 
-  if (error) throw error;
+  if (error) {
+    return { success: false, error: error.message };
+  }
+  return { success: true };
 };
 
 // Delete a pill from cloud
-export const deletePillFromCloud = async (pillId: string): Promise<void> => {
+export const deletePillFromCloud = async (pillId: string, expectedUserId: string): Promise<SyncResult> => {
+  if (!await verifySessionUser(expectedUserId)) {
+    return { success: false, error: 'User changed', aborted: true };
+  }
+
   const { error } = await supabase.from('pills').delete().eq('id', pillId);
-  if (error) throw error;
+  if (error) {
+    return { success: false, error: error.message };
+  }
+  return { success: true };
 };

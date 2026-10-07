@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import { Pill, Reminder, HistoryEntry } from './types';
+import { Pill, HistoryEntry } from './types';
 import Header from './components/Header';
 import PillList from './components/PillList';
 import AddPillModal from './components/AddPillModal';
@@ -8,20 +8,43 @@ import Auth from './components/Auth';
 import DoctorReport from './components/DoctorReport';
 import { ChatIcon, PlusIcon } from './components/icons/Icons';
 import { playSound } from './services/soundService';
-import { onAuthStateChange, signOut, type User } from './services/authService';
+import { onAuthStateChange, signOut, cleanupUserData, type User } from './services/authService';
 import { loadPillsFromCloud, syncPillsToCloud } from './services/pillsService';
 import {
   requestNotificationPermission,
-  getNotificationPermission,
   fireImmediateNotification,
   scheduleReminderNotifications,
   cancelAllPillNotifications,
-  cancelReminderNotifications,
+  cancelAllScheduledNotifications,
+  scheduleAllPillNotifications,
   registerNotificationListeners,
   isNative,
+  type NotificationListenerHandle,
 } from './services/notificationService';
+import {
+  loadPillsFromStorage,
+  savePillsToStorage,
+  loadCloudIdsFromStorage,
+  saveCloudIdsToStorage,
+  getLastMissedSweepDate,
+  setLastMissedSweepDate,
+  setPendingSync,
+  hasPendingSync,
+  purgeLegacyUnscopedData,
+  getDateString,
+} from './lib/storage';
+import {
+  isReminderTakenToday,
+  recordMissedDoses,
+  removeLatestTakenEntry,
+  enhancePillsWithDerivedStatus,
+} from './lib/pillHelpers';
 
-const SYNC_DEBOUNCE_MS = 2000;
+// Purge legacy unscoped data at module load, BEFORE auth
+// This prevents data from old versions being shown to any user
+purgeLegacyUnscopedData();
+
+const SYNC_DEBOUNCE_MS = 1500;
 
 // ─── Web-only Notification helpers (used when not running natively) ───────────
 
@@ -47,209 +70,436 @@ const showWebNotification = (title: string, body: string) => {
   }
 };
 
-// ─── Missed dose logging ──────────────────────────────────────────────────────
-// Key: stores the last date we ran the end-of-day missed-dose sweep
-const MISSED_DOSE_SWEEP_KEY = 'remedi_last_missed_sweep';
-
-const getTodayDateString = () => new Date().toDateString();
-const getYesterdayDateString = () => {
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  return d.toDateString();
-};
-
-/**
- * At end of day, any reminder that was scheduled today but not marked taken
- * (and not currently snoozed) is recorded as 'missed' in history.
- * We run this check once per day when the app is open, covering yesterday.
- */
-const recordMissedDoses = (pills: Pill[], setPills: React.Dispatch<React.SetStateAction<Pill[]>>) => {
-  const lastSweep = localStorage.getItem(MISSED_DOSE_SWEEP_KEY);
-  const yesterday = getYesterdayDateString();
-  if (lastSweep === yesterday) return; // already ran for yesterday
-
-  const yesterdayDate = new Date();
-  yesterdayDate.setDate(yesterdayDate.getDate() - 1);
-  const yesterdayDay = yesterdayDate.getDay();
-
-  let anyGlobalChanges = false;
-
-  const updatedPills = pills.map(pill => {
-    const newHistory = [...(pill.history || [])];
-    let pillHasChanges = false;
-    
-    pill.reminders.forEach(reminder => {
-      if (!reminder.daysOfWeek.includes(yesterdayDay)) return; // not scheduled yesterday
-      if (reminder.taken) return; // taken today resets at midnight — handled separately
-
-      // Check if there's already a 'taken' or 'missed' entry for yesterday
-      const yesterdayStart = new Date(yesterdayDate);
-      yesterdayStart.setHours(0, 0, 0, 0);
-      const yesterdayEnd = new Date(yesterdayDate);
-      yesterdayEnd.setHours(23, 59, 59, 999);
-
-      const alreadyLogged = newHistory.some(h =>
-        h.reminderId === reminder.id &&
-        h.timestamp >= yesterdayStart.getTime() &&
-        h.timestamp <= yesterdayEnd.getTime() &&
-        (h.action === 'taken' || h.action === 'missed')
-      );
-
-      if (!alreadyLogged) {
-        newHistory.push({
-          id: `missed-${Date.now()}-${reminder.id}`,
-          reminderId: reminder.id,
-          pillName: pill.name,
-          time: reminder.time,
-          action: 'missed',
-          timestamp: yesterdayEnd.getTime(),
-        });
-        pillHasChanges = true;
-        anyGlobalChanges = true;
-      }
-    });
-    return pillHasChanges ? { ...pill, history: newHistory } : pill;
-  });
-
-  if (anyGlobalChanges) {
-    setPills(updatedPills);
-  }
-  localStorage.setItem(MISSED_DOSE_SWEEP_KEY, yesterday);
-};
-
-// ─── Reset taken status at midnight ──────────────────────────────────────────
-const resetTakenAtMidnight = (setPills: React.Dispatch<React.SetStateAction<Pill[]>>) => {
-  setPills(prev => prev.map(pill => ({
-    ...pill,
-    reminders: pill.reminders.map(r => ({
-      ...r,
-      taken: false,
-      snoozedUntil: undefined,
-    })),
-  })));
-};
-
-// ─── App ──────────────────────────────────────────────────────────────────────
+// ─── App (auth wrapper) ───────────────────────────────────────────────────────
 
 const App: React.FC = () => {
   const [user, setUser] = useState<User | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
-  const [notifDismissed, setNotifDismissed] = useState(false);
-  const syncTimeoutRef = useRef<number | undefined>(undefined);
-  const pillsRef = useRef<Pill[]>([]);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
+  
+  // Track previous user ID to detect user switches
+  const prevUserIdRef = useRef<string | null>(null);
+  // Flag to block writes during sign-out (shared with SignedInApp)
+  const signingOutRef = useRef(false);
+  // Flush callback from SignedInApp
+  const flushCallbackRef = useRef<(() => Promise<void>) | null>(null);
 
-  const [pills, setPills] = useState<Pill[]>(() => {
-    try {
-      const storedPills = localStorage.getItem('pills');
-      if (storedPills) return JSON.parse(storedPills);
-    } catch (error) {
-      console.error('Failed to parse pills from localStorage', error);
-    }
-    return [];
-  });
-
-  // Keep ref in sync for use inside intervals/callbacks
-  useEffect(() => { pillsRef.current = pills; }, [pills]);
-
-  const [isAddPillModalOpen, setAddPillModalOpen] = useState(false);
-  const [isChatModalOpen, setChatModalOpen] = useState(false);
-  const [isReportOpen, setReportOpen] = useState(false);
-  const [pillToEdit, setPillToEdit] = useState<Pill | undefined>(undefined);
-
-  // ── Auth listener ──
+  // ─── Auth listener ──────────────────────────────────────────────────────────
   useEffect(() => {
-    const { data: { subscription } } = onAuthStateChange(async (currentUser) => {
+    const { data: { subscription } } = onAuthStateChange(async (currentUser, event) => {
+      const currentUserId = currentUser?.id ?? null;
+      const prevUserId = prevUserIdRef.current;
+      
+      // Handle sign-out from ANY source (button, expiry, another tab, revocation)
+      if (event === 'SIGNED_OUT') {
+        // Clear previous user's data if we know who they were
+        if (prevUserId) {
+          await cleanupUserData(prevUserId);
+        }
+        signingOutRef.current = false;
+        prevUserIdRef.current = null;
+        setUserId(null);
+        setUser(null);
+        setAuthLoading(false);
+        return;
+      }
+      
+      // Ignore TOKEN_REFRESHED and USER_UPDATED - they don't change the user ID
+      // This prevents dropping unsynced edits on hourly token refresh
+      if (event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED') {
+        return;
+      }
+      
+      // Detect user change (direct switch without SIGNED_OUT)
+      // This can happen via cross-tab sign-in, OAuth redirect, etc.
+      if (prevUserId && currentUserId && prevUserId !== currentUserId) {
+        // Clean up previous user's data before loading new user
+        await cleanupUserData(prevUserId);
+      }
+      
+      prevUserIdRef.current = currentUserId;
+      setUserId(currentUserId);
       setUser(currentUser);
       setAuthLoading(false);
+      
       if (currentUser) {
         // Request notification permission — native or web
         await requestNotificationPermission();
         if (!isNative()) await requestWebNotificationPermission();
-        // Register native notification tap handler
-        registerNotificationListeners((pillId, reminderId) => {
-          toggleReminderTaken(pillId, reminderId);
-        });
       }
     });
     return () => subscription.unsubscribe();
   }, []);
 
-  // ── Load from cloud on login ──
+  const handleSignOut = useCallback(async () => {
+    const currentUserId = prevUserIdRef.current;
+    signingOutRef.current = true;
+    setSignOutError(null);
+    
+    // Pass flush callback to signOut so it can save pending edits BEFORE clearing
+    const result = await signOut(
+      currentUserId ?? undefined,
+      flushCallbackRef.current ?? undefined
+    );
+    
+    if (!result.success) {
+      setSignOutError(result.error ?? 'Sign out failed');
+      // Keep signingOutRef true to block writes
+    } else if (result.localOnly && result.error) {
+      // Partial success - show warning
+      setSignOutError(result.error);
+    }
+    
+    // Hard reload if required (ensures clean state after offline sign-out)
+    if (result.requiresReload) {
+      window.location.reload();
+      return;
+    }
+    
+    // On normal success, SIGNED_OUT event will handle the rest
+    if (result.success && !result.localOnly) {
+      signingOutRef.current = false;
+    }
+  }, []);
+
+  // ─── Render ─────────────────────────────────────────────────────────────────
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-sky-100 flex items-center justify-center">
+        <div className="text-slate-500">Loading...</div>
+      </div>
+    );
+  }
+
+  if (!user || !userId) return <Auth />;
+
+  // Key by userId to ensure all state is reset when user changes (S2)
+  return (
+    <SignedInApp
+      key={userId}
+      user={user}
+      userId={userId}
+      signingOutRef={signingOutRef}
+      flushCallbackRef={flushCallbackRef}
+      signOutError={signOutError}
+      onSignOut={handleSignOut}
+      onClearError={() => setSignOutError(null)}
+    />
+  );
+};
+
+// ─── SignedInApp (keyed by userId for isolation) ──────────────────────────────
+
+interface SignedInAppProps {
+  user: User;
+  userId: string;
+  signingOutRef: React.MutableRefObject<boolean>;
+  flushCallbackRef: React.MutableRefObject<(() => Promise<void>) | null>;
+  signOutError: string | null;
+  onSignOut: () => void;
+  onClearError: () => void;
+}
+
+const SignedInApp: React.FC<SignedInAppProps> = ({
+  user,
+  userId,
+  signingOutRef,
+  flushCallbackRef,
+  signOutError,
+  onSignOut,
+  onClearError,
+}) => {
+  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
+  const [notifDismissed, setNotifDismissed] = useState(false);
+  
+  // Track whether initial cloud load succeeded - NEVER sync before this
+  const cloudLoadSucceededRef = useRef(false);
+  // Track which user ID we loaded for (prevents cross-user writes)
+  const loadedForUserIdRef = useRef<string | null>(null);
+  const syncTimeoutRef = useRef<number | undefined>(undefined);
+  const pillsRef = useRef<Pill[]>([]);
+  const cloudIdsRef = useRef<Set<string>>(new Set());
+  // Notification listener handle for cleanup
+  const notifListenerRef = useRef<NotificationListenerHandle | null>(null);
+
+  const [pills, setPills] = useState<Pill[]>([]);
+
+  // UI state - all reset per-user due to key={userId} remount
+  const [isAddPillModalOpen, setAddPillModalOpen] = useState(false);
+  const [isChatModalOpen, setChatModalOpen] = useState(false);
+  const [isReportOpen, setReportOpen] = useState(false);
+  const [pillToEdit, setPillToEdit] = useState<Pill | undefined>(undefined);
+
+  // Keep ref in sync
+  useEffect(() => { pillsRef.current = pills; }, [pills]);
+
+  // ─── Mark taken handler (for notification taps) ─────────────────────────────
+  const markReminderTaken = useCallback((pillId: string, reminderId: string) => {
+    setPills(prevPills => prevPills.map(pill => {
+      if (pill.id === pillId) {
+        const history = pill.history || [];
+        const alreadyTaken = isReminderTakenToday(history, reminderId);
+        
+        if (alreadyTaken) return pill;
+        
+        const reminder = pill.reminders.find(r => r.id === reminderId);
+        if (!reminder) return pill;
+        
+        const newHistoryEntry: HistoryEntry = {
+          id: `${Date.now()}-${reminderId}`,
+          reminderId: reminderId,
+          pillName: pill.name,
+          time: reminder.time,
+          action: 'taken',
+          timestamp: Date.now(),
+        };
+        
+        const updatedReminders = pill.reminders.map(r =>
+          r.id === reminderId ? { ...r, snoozedUntil: undefined, taken: true } : r
+        );
+        
+        return {
+          ...pill,
+          reminders: updatedReminders,
+          history: [...history, newHistoryEntry],
+        };
+      }
+      return pill;
+    }));
+  }, []);
+
+  // ─── Register notification listener inside SignedInApp (B2 fix) ─────────────
   useEffect(() => {
-    if (!user) return;
+    const setupListener = async () => {
+      if (isNative()) {
+        notifListenerRef.current = await registerNotificationListeners(markReminderTaken);
+      }
+    };
+    setupListener();
+    
+    return () => {
+      // Clean up listener on unmount (sign-out or user change)
+      if (notifListenerRef.current) {
+        notifListenerRef.current.remove();
+        notifListenerRef.current = null;
+      }
+    };
+  }, [markReminderTaken]);
+
+  // ─── Flush pending sync (for visibilitychange/pagehide AND sign-out) ────────
+  const flushPendingSync = useCallback(async () => {
+    // Allow flush during sign-out (we WANT to save before clearing)
+    // But don't flush if not for this user
+    if (!cloudLoadSucceededRef.current) return;
+    if (loadedForUserIdRef.current !== userId) return;
+    
+    // Cancel any pending debounced sync
+    if (syncTimeoutRef.current) {
+      clearTimeout(syncTimeoutRef.current);
+      syncTimeoutRef.current = undefined;
+    }
+    
+    // Check if there's actually pending changes
+    if (!hasPendingSync(userId)) return;
+    
+    try {
+      const result = await syncPillsToCloud(userId, pillsRef.current, cloudIdsRef.current);
+      if (result.success) {
+        saveCloudIdsToStorage(userId, new Set(pillsRef.current.map(p => p.id)));
+        cloudIdsRef.current = new Set(pillsRef.current.map(p => p.id));
+        setPendingSync(userId, false);
+      }
+    } catch (err) {
+      console.error('Flush sync failed:', err);
+    }
+  }, [userId]);
+
+  // Register flush callback for sign-out to use
+  useEffect(() => {
+    flushCallbackRef.current = flushPendingSync;
+    return () => {
+      flushCallbackRef.current = null;
+    };
+  }, [flushPendingSync, flushCallbackRef]);
+
+  // ─── Load from cloud on mount ───────────────────────────────────────────────
+  useEffect(() => {
     const loadCloud = async () => {
+      // Reset load state
+      cloudLoadSucceededRef.current = false;
+      loadedForUserIdRef.current = null;
+      
+      // Load from local storage for this user (immediate UI)
+      const localPills = loadPillsFromStorage(userId);
+      if (localPills.length > 0) {
+        setPills(enhancePillsWithDerivedStatus(localPills));
+      }
+      
+      // Load cloud IDs from storage
+      cloudIdsRef.current = loadCloudIdsFromStorage(userId);
+      
       try {
         setSyncStatus('syncing');
         const cloudPills = await loadPillsFromCloud();
-        if (cloudPills.length > 0) {
-          setPills(cloudPills);
-          localStorage.setItem('pills', JSON.stringify(cloudPills));
+        
+        // Cloud load succeeded - mark this BEFORE any sync can happen
+        cloudLoadSucceededRef.current = true;
+        loadedForUserIdRef.current = userId;
+        
+        // Update cloud IDs tracking
+        const newCloudIds = new Set<string>(cloudPills.map(p => p.id));
+        cloudIdsRef.current = newCloudIds;
+        saveCloudIdsToStorage(userId, newCloudIds);
+        
+        // Use cloud data, enhanced with derived taken status
+        const enhancedPills = enhancePillsWithDerivedStatus(cloudPills);
+        setPills(enhancedPills);
+        savePillsToStorage(userId, enhancedPills);
+        
+        // Cancel any existing native notifications and reschedule from cloud data
+        // This ensures notifications match the user's actual pills
+        if (isNative()) {
+          await cancelAllScheduledNotifications();
+          await scheduleAllPillNotifications(cloudPills);
         }
+        
         setSyncStatus('synced');
+        
+        // Clear any stale pending sync flag
+        setPendingSync(userId, false);
       } catch (err) {
         console.error('Failed to load from cloud:', err);
         setSyncStatus('error');
+        // DO NOT set cloudLoadSucceededRef.current = true here
+        // This prevents destructive sync when load fails
       }
     };
+    
     loadCloud();
-  }, [user]);
+  }, [userId]); // Only depends on userId, not user object (S6)
 
-  // ── Persist to localStorage ──
+  // ─── Persist to localStorage (user-scoped) ──────────────────────────────────
   useEffect(() => {
-    try {
-      localStorage.setItem('pills', JSON.stringify(pills));
-    } catch (error) {
-      console.error('Failed to save pills to localStorage', error);
-    }
-  }, [pills]);
+    // Block writes during sign-out or if we haven't loaded for this user
+    if (signingOutRef.current) return;
+    if (loadedForUserIdRef.current !== userId) return;
+    
+    savePillsToStorage(userId, pills);
+  }, [pills, userId]);
 
-  // ── Debounced cloud sync ──
+  // ─── Debounced cloud sync (only after successful load) ──────────────────────
   useEffect(() => {
-    if (!user) return;
+    // Block sync during sign-out or before load succeeds
+    if (signingOutRef.current) return;
+    if (!cloudLoadSucceededRef.current) return;
+    if (loadedForUserIdRef.current !== userId) return;
+    
+    // Mark that there's a pending sync
+    setPendingSync(userId, true);
+    
     if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
     setSyncStatus('idle');
+    
     syncTimeoutRef.current = window.setTimeout(async () => {
+      // Double-check we should still sync
+      if (signingOutRef.current) return;
+      if (loadedForUserIdRef.current !== userId) return;
+      
       try {
         setSyncStatus('syncing');
-        await syncPillsToCloud(pills);
-        setSyncStatus('synced');
+        const result = await syncPillsToCloud(userId, pills, cloudIdsRef.current);
+        
+        if (result.aborted) {
+          // User changed during sync - don't update state
+          console.warn('Sync aborted:', result.error);
+          setSyncStatus('error');
+          return;
+        }
+        
+        if (result.success) {
+          const newCloudIds = new Set<string>(pills.map(p => p.id));
+          cloudIdsRef.current = newCloudIds;
+          saveCloudIdsToStorage(userId, newCloudIds);
+          setPendingSync(userId, false);
+          setSyncStatus('synced');
+        } else {
+          console.error('Cloud sync failed:', result.error);
+          setSyncStatus('error');
+        }
       } catch (err) {
         console.error('Cloud sync failed:', err);
         setSyncStatus('error');
       }
     }, SYNC_DEBOUNCE_MS);
-    return () => { if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current); };
-  }, [pills, user]);
+    
+    return () => {
+      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+    };
+  }, [pills, userId]);
 
-  // ── Snooze expiry check (every 30s) — re-triggers alarm when snooze ends ──
+  // ─── Flush sync on tab close/hide ───────────────────────────────────────────
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden' && !signingOutRef.current) {
+        flushPendingSync();
+      }
+    };
+    
+    const handlePageHide = () => {
+      if (!signingOutRef.current) {
+        flushPendingSync();
+      }
+    };
+    
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handlePageHide);
+    
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handlePageHide);
+    };
+  }, [flushPendingSync]);
+
+  // ─── Snooze expiry check (every 30s) — re-triggers alarm when snooze ends ───
+  // Compute due alarms from ref OUTSIDE the updater, then do state update
   useEffect(() => {
     const interval = setInterval(() => {
       const now = Date.now();
-      let hasChanges = false;
-      const reAlarmPills: { pillName: string; pillSound?: string; reminderTime: string }[] = [];
-
-      const updatedPills = pillsRef.current.map(pill => {
-        const newReminders = pill.reminders.map(reminder => {
+      
+      // Compute which alarms are due from current pills ref
+      const dueAlarms: { pillName: string; pillSound?: string; reminderTime: string }[] = [];
+      const expiredReminderIds = new Set<string>();
+      
+      pillsRef.current.forEach(pill => {
+        pill.reminders.forEach(reminder => {
           if (reminder.snoozedUntil && reminder.snoozedUntil <= now) {
-            hasChanges = true;
-            reAlarmPills.push({
+            dueAlarms.push({
               pillName: pill.name,
               pillSound: pill.notificationSound,
               reminderTime: reminder.time,
             });
-            const { snoozedUntil, ...rest } = reminder;
-            return rest;
+            expiredReminderIds.add(`${pill.id}:${reminder.id}`);
           }
-          return reminder;
         });
-        return { ...pill, reminders: newReminders };
       });
-
-      if (hasChanges) {
-        setPills(updatedPills);
-        // Re-alarm for each expired snooze
-        reAlarmPills.forEach(({ pillName, pillSound, reminderTime }) => {
+      
+      // Only update state if there are expired snoozes
+      if (expiredReminderIds.size > 0) {
+        setPills(prev => prev.map(pill => ({
+          ...pill,
+          reminders: pill.reminders.map(reminder => {
+            if (expiredReminderIds.has(`${pill.id}:${reminder.id}`)) {
+              const { snoozedUntil, ...rest } = reminder;
+              return rest;
+            }
+            return reminder;
+          }),
+        })));
+        
+        // Fire alarms
+        dueAlarms.forEach(({ pillName, pillSound, reminderTime }) => {
           if (isNative()) {
             fireImmediateNotification(`⏰ ${pillName}`, `Your snoozed reminder for ${reminderTime} is due!`);
           } else {
@@ -262,27 +512,30 @@ const App: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
-  // ── Midnight reset + missed dose sweep ──
+  // ─── Missed dose sweep on load (covers all days since last sweep) ───────────
   useEffect(() => {
-    if (!user) return;
-    // Run missed dose sweep on load (covers yesterday)
-    recordMissedDoses(pillsRef.current, setPills);
+    if (!cloudLoadSucceededRef.current) return;
+    if (pills.length === 0) return;
+    
+    const lastSweep = getLastMissedSweepDate(userId);
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayStr = getDateString(yesterday);
+    
+    // Only sweep if we haven't swept up to yesterday
+    if (lastSweep === yesterdayStr) return;
+    
+    const { updatedPills, hasChanges } = recordMissedDoses(pills, lastSweep);
+    
+    if (hasChanges) {
+      setPills(updatedPills);
+    }
+    
+    // Mark that we've swept up to yesterday
+    setLastMissedSweepDate(userId, yesterdayStr);
+  }, [userId, pills.length]);
 
-    // Schedule midnight reset
-    const now = new Date();
-    const midnight = new Date(now);
-    midnight.setHours(24, 0, 5, 0); // 5 seconds past midnight
-    const msUntilMidnight = midnight.getTime() - now.getTime();
-
-    const midnightTimeout = setTimeout(() => {
-      recordMissedDoses(pillsRef.current, setPills);
-      resetTakenAtMidnight(setPills);
-    }, msUntilMidnight);
-
-    return () => clearTimeout(midnightTimeout);
-  }, [user]);
-
-  // ── Due reminder check (fires at each minute boundary) ──
+  // ─── Due reminder check (fires at each minute boundary) ─────────────────────
   useEffect(() => {
     let intervalId: number | undefined;
 
@@ -296,10 +549,12 @@ const App: React.FC = () => {
           const isDue = reminder.time === currentTime;
           const isToday = reminder.daysOfWeek.includes(currentDay);
           const isSnoozed = reminder.snoozedUntil && reminder.snoozedUntil > now.getTime();
+          
+          // Use derived taken status from history
+          const isTaken = isReminderTakenToday(pill.history || [], reminder.id);
 
-          if (isDue && isToday && !reminder.taken && !isSnoozed) {
+          if (isDue && isToday && !isTaken && !isSnoozed) {
             if (isNative()) {
-              // On native, OS already delivered the notification — just handle in-app feedback
               fireImmediateNotification(
                 `💊 Time for ${pill.name}`,
                 pill.dosage ? `${pill.dosage} — tap to mark as taken` : 'Tap to mark as taken'
@@ -329,16 +584,33 @@ const App: React.FC = () => {
       clearTimeout(timeoutId);
       if (intervalId) clearInterval(intervalId);
     };
-  }, []); // runs once — uses pillsRef so always sees latest pills
+  }, []);
 
   // ─── Handlers ───────────────────────────────────────────────────────────────
 
   const savePill = async (pillData: Omit<Pill, 'id' | 'history'> | Pill) => {
     let savedPill: Pill;
     if ('id' in pillData && pillData.id) {
-      savedPill = pillData as Pill;
-      setPills(prevPills => prevPills.map(p => (p.id === savedPill.id ? { ...p, ...savedPill } : p)));
-      // Cancel old notifications and reschedule with updated schedule
+      // Editing existing pill - preserve history
+      const existingPill = pills.find(p => p.id === pillData.id);
+      savedPill = {
+        ...(pillData as Pill),
+        history: existingPill?.history || (pillData as Pill).history || [],
+      };
+      
+      // Preserve snoozedUntil from existing reminders
+      savedPill.reminders = savedPill.reminders.map(newReminder => {
+        const existingReminder = existingPill?.reminders.find(r => r.id === newReminder.id);
+        return {
+          ...newReminder,
+          snoozedUntil: existingReminder?.snoozedUntil,
+          taken: false, // Derived from history
+        };
+      });
+      
+      setPills(prevPills => prevPills.map(p => (p.id === savedPill.id ? savedPill : p)));
+      
+      // Cancel old notifications and reschedule
       if (isNative()) {
         const oldPill = pills.find(p => p.id === savedPill.id);
         if (oldPill) await cancelAllPillNotifications(oldPill.id, oldPill.reminders);
@@ -351,7 +623,12 @@ const App: React.FC = () => {
       }
     } else {
       savedPill = { ...pillData, id: Date.now().toString(), history: [] };
+      savedPill.reminders = savedPill.reminders.map(r => ({
+        ...r,
+        taken: false,
+      }));
       setPills(prevPills => [...prevPills, savedPill]);
+      
       // Schedule notifications for new pill
       if (isNative()) {
         for (const reminder of savedPill.reminders) {
@@ -370,31 +647,45 @@ const App: React.FC = () => {
   const openEditModal = (pill: Pill) => { setPillToEdit(pill); setAddPillModalOpen(true); };
   const closeModal = () => { setAddPillModalOpen(false); setPillToEdit(undefined); };
 
+  // Toggle taken (for UI - allows un-marking)
   const toggleReminderTaken = useCallback((pillId: string, reminderId: string) => {
     setPills(prevPills => prevPills.map(pill => {
       if (pill.id === pillId) {
-        let newHistoryEntry: HistoryEntry | undefined;
-        const updatedReminders = pill.reminders.map(reminder => {
-          if (reminder.id === reminderId) {
-            const willBeTaken = !reminder.taken;
-            if (willBeTaken) {
-              newHistoryEntry = {
-                id: `${Date.now()}-${reminderId}`,
-                reminderId: reminder.id,
-                pillName: pill.name,
-                time: reminder.time,
-                action: 'taken',
-                timestamp: Date.now(),
-              };
-            }
-            const newReminder = { ...reminder, taken: willBeTaken };
-            if (newReminder.taken) delete newReminder.snoozedUntil;
-            return newReminder;
-          }
-          return reminder;
-        });
-        const updatedHistory = newHistoryEntry ? [...(pill.history || []), newHistoryEntry] : pill.history;
-        return { ...pill, reminders: updatedReminders, history: updatedHistory };
+        const history = pill.history || [];
+        const currentlyTaken = isReminderTakenToday(history, reminderId);
+        const reminder = pill.reminders.find(r => r.id === reminderId);
+        
+        if (!reminder) return pill;
+        
+        if (currentlyTaken) {
+          const updatedHistory = removeLatestTakenEntry(history, reminderId);
+          return {
+            ...pill,
+            reminders: pill.reminders.map(r =>
+              r.id === reminderId ? { ...r, taken: false } : r
+            ),
+            history: updatedHistory,
+          };
+        } else {
+          const newHistoryEntry: HistoryEntry = {
+            id: `${Date.now()}-${reminderId}`,
+            reminderId: reminderId,
+            pillName: pill.name,
+            time: reminder.time,
+            action: 'taken',
+            timestamp: Date.now(),
+          };
+          
+          const updatedReminders = pill.reminders.map(r =>
+            r.id === reminderId ? { ...r, snoozedUntil: undefined, taken: true } : r
+          );
+          
+          return {
+            ...pill,
+            reminders: updatedReminders,
+            history: [...history, newHistoryEntry],
+          };
+        }
       }
       return pill;
     }));
@@ -403,23 +694,29 @@ const App: React.FC = () => {
   const snoozeReminder = useCallback((pillId: string, reminderId: string, duration: number) => {
     setPills(prevPills => prevPills.map(pill => {
       if (pill.id === pillId) {
-        let newHistoryEntry: HistoryEntry | undefined;
-        const updatedReminders = pill.reminders.map(reminder => {
-          if (reminder.id === reminderId) {
-            newHistoryEntry = {
-              id: `${Date.now()}-${reminderId}`,
-              reminderId: reminder.id,
-              pillName: pill.name,
-              time: reminder.time,
-              action: 'snoozed',
-              timestamp: Date.now(),
-            };
-            return { ...reminder, snoozedUntil: Date.now() + duration, taken: false };
-          }
-          return reminder;
-        });
-        const updatedHistory = newHistoryEntry ? [...(pill.history || []), newHistoryEntry] : pill.history;
-        return { ...pill, reminders: updatedReminders, history: updatedHistory };
+        const reminder = pill.reminders.find(r => r.id === reminderId);
+        if (!reminder) return pill;
+        
+        const newHistoryEntry: HistoryEntry = {
+          id: `${Date.now()}-${reminderId}`,
+          reminderId: reminder.id,
+          pillName: pill.name,
+          time: reminder.time,
+          action: 'snoozed',
+          timestamp: Date.now(),
+        };
+        
+        const updatedReminders = pill.reminders.map(r =>
+          r.id === reminderId
+            ? { ...r, snoozedUntil: Date.now() + duration, taken: false }
+            : r
+        );
+        
+        return {
+          ...pill,
+          reminders: updatedReminders,
+          history: [...(pill.history || []), newHistoryEntry],
+        };
       }
       return pill;
     }));
@@ -433,21 +730,22 @@ const App: React.FC = () => {
     setPills(prevPills => prevPills.filter(pill => pill.id !== pillId));
   }, []);
 
-  // ─── Render ──────────────────────────────────────────────────────────────────
+  // ─── Derive taken status for display ────────────────────────────────────────
+  const displayPills = enhancePillsWithDerivedStatus(pills);
 
-  if (authLoading) {
-    return (
-      <div className="min-h-screen bg-sky-100 flex items-center justify-center">
-        <div className="text-slate-500">Loading...</div>
-      </div>
-    );
-  }
-
-  if (!user) return <Auth />;
+  // ─── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <div className="min-h-screen bg-sky-100 font-sans text-slate-800">
       <div className="container mx-auto max-w-2xl p-4 pb-28">
+        {/* Sign-out error banner */}
+        {signOutError && (
+          <div className="mb-3 p-3 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-800 flex items-start justify-between gap-2">
+            <span>{signOutError}</span>
+            <button onClick={onClearError} className="text-amber-400 hover:text-amber-600 flex-shrink-0">✕</button>
+          </div>
+        )}
+
         {/* Notification permission denied banner (web only) */}
         {!isNative() && !notifDismissed &&
           'Notification' in window &&
@@ -480,13 +778,13 @@ const App: React.FC = () => {
             >
               🩺 Report
             </button>
-            <button onClick={signOut} className="text-xs text-slate-400 hover:text-slate-600">Sign out</button>
+            <button onClick={onSignOut} className="text-xs text-slate-400 hover:text-slate-600">Sign out</button>
           </div>
         </div>
 
         <main>
           <PillList
-            pills={pills}
+            pills={displayPills}
             onToggleTaken={toggleReminderTaken}
             onDeletePill={deletePill}
             onSnoozeReminder={snoozeReminder}
@@ -502,7 +800,7 @@ const App: React.FC = () => {
         <ChatModal onClose={() => setChatModalOpen(false)} />
       )}
       {isReportOpen && (
-        <DoctorReport pills={pills} onClose={() => setReportOpen(false)} />
+        <DoctorReport pills={displayPills} onClose={() => setReportOpen(false)} />
       )}
 
       <div className="fixed bottom-0 left-0 right-0 h-24 bg-gradient-to-t from-sky-100 to-transparent pointer-events-none z-30"></div>
