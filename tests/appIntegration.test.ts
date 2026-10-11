@@ -1,6 +1,20 @@
+// tests/appIntegration.test.ts
+// Tests for App-level orchestration: tap queue and sweep-after-load
+// These tests import the ACTUAL functions from lib/loadOrchestration.ts
+// If you break those functions, these tests MUST fail.
+
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { getDateString, parseLocalDateString } from '../lib/storage';
+import {
+  shouldQueueTap,
+  filterTapsForUser,
+  applyTakenMarkToPill,
+  applyQueuedTapsToPills,
+  shouldRunSweepAfterLoad,
+  orchestrateAfterCloudLoad,
+  type QueuedTap,
+} from '../lib/loadOrchestration';
 import { recordMissedDoses } from '../lib/pillHelpers';
+import { getDateString } from '../lib/storage';
 import type { Pill, HistoryEntry } from '../types';
 
 // Helper to create pills for testing
@@ -20,206 +34,285 @@ const createTestPill = (
   createdAt,
 });
 
-describe('App Integration: Missed Dose Sweep', () => {
-  describe('sweep runs after cloud load', () => {
-    it('recordMissedDoses is called with pills from cloud', () => {
-      // Simulate a pill that existed for a week
-      const weekAgo = new Date();
-      weekAgo.setDate(weekAgo.getDate() - 7);
-      
-      const pill = createTestPill('p1', 'Old Pill', weekAgo.getTime());
-      
-      // Simulate lastSweep was 3 days ago
-      const threeDaysAgo = new Date();
-      threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
-      const lastSweepStr = getDateString(threeDaysAgo);
-      
-      const result = recordMissedDoses([pill], lastSweepStr);
-      
-      // Should have 2 missed entries (2 days ago and yesterday)
-      expect(result.hasChanges).toBe(true);
-      const missedEntries = result.updatedPills[0].history?.filter(h => h.action === 'missed') || [];
-      expect(missedEntries.length).toBe(2);
+describe('loadOrchestration: Tap Queue', () => {
+  describe('shouldQueueTap', () => {
+    it('returns true when cloud load has not succeeded', () => {
+      expect(shouldQueueTap(false)).toBe(true);
     });
 
-    it('createdAt skips days before pill existed', () => {
-      // Pill created yesterday
-      const yesterday = new Date();
-      yesterday.setDate(yesterday.getDate() - 1);
-      yesterday.setHours(10, 0, 0, 0);
-      
-      const newPill = createTestPill('p1', 'New Pill', yesterday.getTime());
-      
-      // lastSweep was a week ago
-      const weekAgo = new Date();
-      weekAgo.setDate(weekAgo.getDate() - 7);
-      const lastSweepStr = getDateString(weekAgo);
-      
-      const result = recordMissedDoses([newPill], lastSweepStr);
-      
-      // Pill created yesterday - can only miss starting today (which we don't sweep)
-      // So no missed entries should be created
-      expect(result.hasChanges).toBe(false);
+    it('returns false when cloud load has succeeded', () => {
+      expect(shouldQueueTap(true)).toBe(false);
     });
   });
-});
 
-describe('App Integration: Queued Notification Tap', () => {
-  describe('tap queued before cloud load', () => {
-    it('queued tap survives and results in taken status', () => {
-      // This test verifies the queue logic by testing the data flow:
-      // 1. Tap arrives with pillId, reminderId
-      // 2. Cloud load returns pill with that ID
-      // 3. Applying the tap creates a history entry
-      
-      const pillId = 'p1';
-      const reminderId = 'r1';
-      const pillFromCloud = createTestPill(pillId, 'Test Pill');
-      
-      // Simulate applying a queued tap to cloud-loaded pill
-      const applyTakenMark = (pill: Pill, reminderId: string): Pill => {
-        const history = pill.history || [];
-        const reminder = pill.reminders.find(r => r.id === reminderId);
-        if (!reminder) return pill;
-        
-        const newHistoryEntry: HistoryEntry = {
-          id: `${Date.now()}-${reminderId}`,
-          reminderId: reminderId,
-          pillName: pill.name,
-          time: reminder.time,
-          action: 'taken',
-          timestamp: Date.now(),
-        };
-        
-        return {
-          ...pill,
-          history: [...history, newHistoryEntry],
-        };
-      };
-      
-      // Apply the queued tap
-      const updatedPill = applyTakenMark(pillFromCloud, reminderId);
-      
-      // Verify the history entry was created
-      expect(updatedPill.history?.length).toBe(1);
-      expect(updatedPill.history?.[0].action).toBe('taken');
-      expect(updatedPill.history?.[0].reminderId).toBe(reminderId);
+  describe('filterTapsForUser', () => {
+    it('filters taps to only those for the specified user', () => {
+      const queue: QueuedTap[] = [
+        { pillId: 'p1', reminderId: 'r1', userId: 'user-a' },
+        { pillId: 'p2', reminderId: 'r1', userId: 'user-b' },
+        { pillId: 'p3', reminderId: 'r1', userId: 'user-a' },
+      ];
+
+      const result = filterTapsForUser(queue, 'user-a');
+
+      expect(result).toHaveLength(2);
+      expect(result.every(tap => tap.userId === 'user-a')).toBe(true);
     });
 
-    it('queued tap for non-existent pill is safely ignored', () => {
-      const pillFromCloud = createTestPill('p1', 'Test Pill');
-      
-      // Simulate applying a tap for a different pill ID (non-existent)
-      const applyTakenMark = (pills: Pill[], targetPillId: string, reminderId: string): Pill[] => {
-        return pills.map(pill => {
-          if (pill.id !== targetPillId) return pill;
-          
-          const reminder = pill.reminders.find(r => r.id === reminderId);
-          if (!reminder) return pill;
-          
-          const newHistoryEntry: HistoryEntry = {
-            id: `${Date.now()}-${reminderId}`,
-            reminderId: reminderId,
-            pillName: pill.name,
-            time: reminder.time,
-            action: 'taken',
-            timestamp: Date.now(),
-          };
-          
-          return {
-            ...pill,
-            history: [...(pill.history || []), newHistoryEntry],
-          };
-        });
-      };
-      
-      // Try to apply tap for non-existent pill
-      const result = applyTakenMark([pillFromCloud], 'non-existent-pill', 'r1');
-      
-      // Original pill should be unchanged
-      expect(result[0].history?.length ?? 0).toBe(0);
+    it('returns empty array when no taps match', () => {
+      const queue: QueuedTap[] = [
+        { pillId: 'p1', reminderId: 'r1', userId: 'user-a' },
+      ];
+
+      const result = filterTapsForUser(queue, 'user-b');
+
+      expect(result).toHaveLength(0);
+    });
+  });
+
+  describe('applyTakenMarkToPill', () => {
+    it('adds taken history entry to pill', () => {
+      const pill = createTestPill('p1', 'Test Pill');
+
+      const result = applyTakenMarkToPill(pill, 'r1');
+
+      expect(result.history).toHaveLength(1);
+      expect(result.history![0].action).toBe('taken');
+      expect(result.history![0].reminderId).toBe('r1');
     });
 
-    it('queued tap does not create duplicate if already taken', () => {
+    it('returns unchanged pill if already taken today', () => {
       const now = Date.now();
-      const pillWithTakenHistory = createTestPill('p1', 'Test Pill', undefined, [
+      const pill = createTestPill('p1', 'Test Pill', undefined, [
         {
           id: 'existing',
           reminderId: 'r1',
           pillName: 'Test Pill',
           time: '09:00',
           action: 'taken',
-          timestamp: now - 1000, // Taken 1 second ago
+          timestamp: now,
         },
       ]);
-      
-      // Simulate applying a tap that checks for existing taken status
-      const applyTakenMarkSafe = (pill: Pill, reminderId: string): Pill => {
-        const history = pill.history || [];
-        
-        // Check if already taken today (simplified: any taken entry for this reminder)
-        const alreadyTaken = history.some(
-          h => h.reminderId === reminderId && h.action === 'taken'
-        );
-        if (alreadyTaken) return pill;
-        
-        const reminder = pill.reminders.find(r => r.id === reminderId);
-        if (!reminder) return pill;
-        
-        const newHistoryEntry: HistoryEntry = {
-          id: `${Date.now()}-${reminderId}`,
-          reminderId: reminderId,
-          pillName: pill.name,
-          time: reminder.time,
-          action: 'taken',
-          timestamp: Date.now(),
-        };
-        
-        return {
-          ...pill,
-          history: [...history, newHistoryEntry],
-        };
-      };
-      
-      // Apply tap to pill that's already taken
-      const result = applyTakenMarkSafe(pillWithTakenHistory, 'r1');
-      
-      // Should still have only 1 history entry (no duplicate)
-      expect(result.history?.length).toBe(1);
+
+      const result = applyTakenMarkToPill(pill, 'r1');
+
+      // Should not add duplicate
+      expect(result.history).toHaveLength(1);
+      expect(result).toBe(pill); // Same reference = unchanged
+    });
+
+    it('returns unchanged pill if reminder not found', () => {
+      const pill = createTestPill('p1', 'Test Pill');
+
+      const result = applyTakenMarkToPill(pill, 'non-existent-reminder');
+
+      expect(result.history).toHaveLength(0);
+      expect(result).toBe(pill);
     });
   });
 
-  describe('tap applied on load failure', () => {
-    it('tap applied to local state preserves user action', () => {
-      // When cloud load fails, we still have local pills
-      // The queued tap should be applied so user's action isn't lost
-      
-      const localPill = createTestPill('p1', 'Local Pill');
-      
-      const applyTakenMark = (pill: Pill, reminderId: string): Pill => {
-        const reminder = pill.reminders.find(r => r.id === reminderId);
-        if (!reminder) return pill;
-        
-        const newHistoryEntry: HistoryEntry = {
-          id: `${Date.now()}-${reminderId}`,
-          reminderId: reminderId,
-          pillName: pill.name,
-          time: reminder.time,
-          action: 'taken',
-          timestamp: Date.now(),
-        };
-        
-        return {
-          ...pill,
-          history: [...(pill.history || []), newHistoryEntry],
-        };
-      };
-      
-      const result = applyTakenMark(localPill, 'r1');
-      
-      // Tap was applied to local pill
-      expect(result.history?.length).toBe(1);
-      expect(result.history?.[0].action).toBe('taken');
+  describe('applyQueuedTapsToPills', () => {
+    it('applies taps to matching pills', () => {
+      const pills = [
+        createTestPill('p1', 'Pill 1'),
+        createTestPill('p2', 'Pill 2'),
+      ];
+      const taps: QueuedTap[] = [
+        { pillId: 'p1', reminderId: 'r1', userId: 'user-a' },
+      ];
+
+      const result = applyQueuedTapsToPills(pills, taps);
+
+      expect(result[0].history).toHaveLength(1);
+      expect(result[0].history![0].action).toBe('taken');
+      expect(result[1].history).toHaveLength(0); // Unchanged
     });
+
+    it('returns original pills if no taps', () => {
+      const pills = [createTestPill('p1', 'Pill 1')];
+
+      const result = applyQueuedTapsToPills(pills, []);
+
+      expect(result).toBe(pills); // Same reference
+    });
+
+    it('ignores taps for non-existent pills', () => {
+      const pills = [createTestPill('p1', 'Pill 1')];
+      const taps: QueuedTap[] = [
+        { pillId: 'non-existent', reminderId: 'r1', userId: 'user-a' },
+      ];
+
+      const result = applyQueuedTapsToPills(pills, taps);
+
+      expect(result[0].history).toHaveLength(0);
+    });
+  });
+});
+
+describe('loadOrchestration: Sweep After Load', () => {
+  describe('shouldRunSweepAfterLoad', () => {
+    it('returns shouldSweep=true when not swept today', () => {
+      const result = shouldRunSweepAfterLoad('2024-01-14', '2024-01-15', 1);
+
+      expect(result.shouldSweep).toBe(true);
+      expect(result.reason).toBe('sweep needed');
+    });
+
+    it('returns shouldSweep=false when already swept today', () => {
+      const result = shouldRunSweepAfterLoad('2024-01-15', '2024-01-15', 1);
+
+      expect(result.shouldSweep).toBe(false);
+      expect(result.reason).toBe('already swept today');
+    });
+
+    it('returns shouldSweep=false when no pills', () => {
+      const result = shouldRunSweepAfterLoad('2024-01-14', '2024-01-15', 0);
+
+      expect(result.shouldSweep).toBe(false);
+      expect(result.reason).toBe('no pills');
+    });
+  });
+
+  describe('orchestrateAfterCloudLoad', () => {
+    it('runs sweep and applies taps in correct order', () => {
+      const weekAgo = new Date();
+      weekAgo.setDate(weekAgo.getDate() - 7);
+      const pill = createTestPill('p1', 'Old Pill', weekAgo.getTime());
+
+      const threeDaysAgo = new Date();
+      threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
+      const lastSweep = getDateString(threeDaysAgo);
+
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = getDateString(yesterday);
+
+      const queuedTaps: QueuedTap[] = [
+        { pillId: 'p1', reminderId: 'r1', userId: 'user-a' },
+      ];
+
+      const result = orchestrateAfterCloudLoad(
+        [pill],
+        lastSweep,
+        yesterdayStr,
+        queuedTaps,
+        'user-a',
+        recordMissedDoses
+      );
+
+      // Sweep should have run
+      expect(result.sweepRan).toBe(true);
+
+      // Tap should have been applied
+      expect(result.tapsApplied).toBe(1);
+
+      // Pill should have both missed entries and taken entry
+      const history = result.pills[0].history || [];
+      const missedEntries = history.filter(h => h.action === 'missed');
+      const takenEntries = history.filter(h => h.action === 'taken');
+
+      expect(missedEntries.length).toBeGreaterThan(0);
+      expect(takenEntries.length).toBe(1);
+    });
+
+    it('skips sweep when already done today', () => {
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = getDateString(yesterday);
+
+      const pill = createTestPill('p1', 'Pill');
+
+      const result = orchestrateAfterCloudLoad(
+        [pill],
+        yesterdayStr, // Already swept
+        yesterdayStr,
+        [],
+        'user-a',
+        recordMissedDoses
+      );
+
+      expect(result.sweepRan).toBe(false);
+    });
+
+    it('filters taps by user ID', () => {
+      const pill = createTestPill('p1', 'Pill');
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = getDateString(yesterday);
+
+      const queuedTaps: QueuedTap[] = [
+        { pillId: 'p1', reminderId: 'r1', userId: 'user-a' },
+        { pillId: 'p1', reminderId: 'r1', userId: 'user-b' }, // Different user
+      ];
+
+      const result = orchestrateAfterCloudLoad(
+        [pill],
+        yesterdayStr,
+        yesterdayStr,
+        queuedTaps,
+        'user-a', // Only apply taps for user-a
+        recordMissedDoses
+      );
+
+      // Only 1 tap applied (user-a's tap)
+      expect(result.tapsApplied).toBe(1);
+    });
+  });
+});
+
+describe('Missed Dose Sweep: createdAt fallback', () => {
+  it('falls back to numeric id as creation timestamp (pre-build pills)', () => {
+    // Pill with timestamp-based ID but no createdAt (legacy pill)
+    const twoDaysAgo = new Date();
+    twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
+    twoDaysAgo.setHours(12, 0, 0, 0);
+
+    const legacyPill: Pill = {
+      id: twoDaysAgo.getTime().toString(), // Numeric timestamp as ID
+      name: 'Legacy Pill',
+      dosage: '500mg',
+      reminders: [
+        { id: 'r1', time: '09:00', daysOfWeek: [0, 1, 2, 3, 4, 5, 6], taken: false },
+      ],
+      history: [],
+      // No createdAt field
+    };
+
+    // Sweep from a week ago
+    const weekAgo = new Date();
+    weekAgo.setDate(weekAgo.getDate() - 7);
+    const lastSweepStr = getDateString(weekAgo);
+
+    const result = recordMissedDoses([legacyPill], lastSweepStr);
+
+    // Should only have 1 missed entry (yesterday)
+    // Because the pill's ID timestamp indicates it was created 2 days ago
+    // So we can only miss starting the day after (1 day ago = yesterday)
+    const missedEntries = result.updatedPills[0].history?.filter(h => h.action === 'missed') || [];
+    expect(missedEntries.length).toBe(1);
+  });
+
+  it('does not use non-numeric id as fallback', () => {
+    // Pill with non-numeric ID and no createdAt
+    const pillWithStringId: Pill = {
+      id: 'abc-123', // Not a numeric timestamp
+      name: 'String ID Pill',
+      dosage: '500mg',
+      reminders: [
+        { id: 'r1', time: '09:00', daysOfWeek: [0, 1, 2, 3, 4, 5, 6], taken: false },
+      ],
+      history: [],
+    };
+
+    // Sweep from 3 days ago
+    const threeDaysAgo = new Date();
+    threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
+    const lastSweepStr = getDateString(threeDaysAgo);
+
+    const result = recordMissedDoses([pillWithStringId], lastSweepStr);
+
+    // Should have missed entries for all days (no createdAt protection)
+    const missedEntries = result.updatedPills[0].history?.filter(h => h.action === 'missed') || [];
+    expect(missedEntries.length).toBe(2); // 2 days ago and yesterday
   });
 });

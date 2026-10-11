@@ -39,6 +39,12 @@ import {
   removeLatestTakenEntry,
   enhancePillsWithDerivedStatus,
 } from './lib/pillHelpers';
+import {
+  shouldQueueTap,
+  applyTakenMarkToPill,
+  orchestrateAfterCloudLoad,
+  type QueuedTap,
+} from './lib/loadOrchestration';
 
 // Purge legacy unscoped data at module load, BEFORE auth
 // This prevents data from old versions being shown to any user
@@ -224,7 +230,7 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   // Notification listener handle for cleanup
   const notifListenerRef = useRef<NotificationListenerHandle | null>(null);
   // Queue for notification taps that arrive before cloud load completes
-  const pendingNotifTapsRef = useRef<Array<{ pillId: string; reminderId: string; userId: string }>>([]);
+  const pendingNotifTapsRef = useRef<QueuedTap[]>([]);
   // Track if missed dose sweep has run after this load
   const missedSweepDoneRef = useRef(false);
 
@@ -241,9 +247,9 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
 
   // ─── Mark taken handler (for notification taps) ─────────────────────────────
   // If cloud load hasn't completed, queue the tap to apply after load
+  // Uses shouldQueueTap from loadOrchestration for testability
   const markReminderTaken = useCallback((pillId: string, reminderId: string) => {
-    // If cloud load hasn't succeeded yet, queue the tap for later
-    if (!cloudLoadSucceededRef.current) {
+    if (shouldQueueTap(cloudLoadSucceededRef.current)) {
       pendingNotifTapsRef.current.push({ pillId, reminderId, userId });
       return;
     }
@@ -252,35 +258,11 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   }, [userId]);
   
   // Apply taken mark to pills state (used directly and for queued taps)
+  // Uses applyTakenMarkToPill from loadOrchestration for testability
   const applyTakenMark = useCallback((pillId: string, reminderId: string) => {
     setPills(prevPills => prevPills.map(pill => {
       if (pill.id === pillId) {
-        const history = pill.history || [];
-        const alreadyTaken = isReminderTakenToday(history, reminderId);
-        
-        if (alreadyTaken) return pill;
-        
-        const reminder = pill.reminders.find(r => r.id === reminderId);
-        if (!reminder) return pill;
-        
-        const newHistoryEntry: HistoryEntry = {
-          id: `${Date.now()}-${reminderId}`,
-          reminderId: reminderId,
-          pillName: pill.name,
-          time: reminder.time,
-          action: 'taken',
-          timestamp: Date.now(),
-        };
-        
-        const updatedReminders = pill.reminders.map(r =>
-          r.id === reminderId ? { ...r, snoozedUntil: undefined, taken: true } : r
-        );
-        
-        return {
-          ...pill,
-          reminders: updatedReminders,
-          history: [...history, newHistoryEntry],
-        };
+        return applyTakenMarkToPill(pill, reminderId);
       }
       return pill;
     }));
@@ -371,47 +353,38 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
         cloudIdsRef.current = newCloudIds;
         saveCloudIdsToStorage(userId, newCloudIds);
         
-        // Run missed dose sweep BEFORE setting pills
-        // This ensures the sweep runs exactly once after each successful cloud load
-        let pillsAfterSweep = cloudPills;
+        // Run orchestration: sweep + apply queued taps
+        // Uses orchestrateAfterCloudLoad from loadOrchestration for testability
         const lastSweep = getLastMissedSweepDate(userId);
         const yesterday = new Date();
         yesterday.setDate(yesterday.getDate() - 1);
         const yesterdayStr = getDateString(yesterday);
         
-        if (lastSweep !== yesterdayStr && cloudPills.length > 0) {
-          const { updatedPills, hasChanges } = recordMissedDoses(cloudPills, lastSweep);
-          if (hasChanges) {
-            pillsAfterSweep = updatedPills;
-          }
+        const orchestrationResult = orchestrateAfterCloudLoad(
+          cloudPills,
+          lastSweep,
+          yesterdayStr,
+          pendingNotifTapsRef.current,
+          userId,
+          recordMissedDoses
+        );
+        pendingNotifTapsRef.current = [];
+        
+        if (orchestrationResult.sweepRan) {
           setLastMissedSweepDate(userId, yesterdayStr);
         }
         missedSweepDoneRef.current = true;
         
-        // Use cloud data (with sweep applied), enhanced with derived taken status
-        const enhancedPills = enhancePillsWithDerivedStatus(pillsAfterSweep);
+        // Use orchestrated pills, enhanced with derived taken status
+        const enhancedPills = enhancePillsWithDerivedStatus(orchestrationResult.pills);
         setPills(enhancedPills);
         savePillsToStorage(userId, enhancedPills);
-        
-        // Apply any queued notification taps that arrived during load
-        // Filter to only taps for this user (in case of rapid user switch)
-        const queuedTaps = pendingNotifTapsRef.current.filter(tap => tap.userId === userId);
-        pendingNotifTapsRef.current = [];
-        
-        // Apply queued taps after a microtask to ensure state is settled
-        if (queuedTaps.length > 0) {
-          setTimeout(() => {
-            queuedTaps.forEach(({ pillId, reminderId }) => {
-              applyTakenMark(pillId, reminderId);
-            });
-          }, 0);
-        }
         
         // Cancel any existing native notifications and reschedule from cloud data
         // This ensures notifications match the user's actual pills
         if (isNative()) {
           await cancelAllScheduledNotifications();
-          await scheduleAllPillNotifications(pillsAfterSweep);
+          await scheduleAllPillNotifications(orchestrationResult.pills);
         }
         
         setSyncStatus('synced');
@@ -426,12 +399,12 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
         
         // On load failure, apply queued taps to local state so user's action isn't lost
         // They'll be in localStorage and can sync when connection is restored
-        const queuedTaps = pendingNotifTapsRef.current.filter(tap => tap.userId === userId);
+        // Uses applyQueuedTapsToPills from loadOrchestration for testability
+        const { filterTapsForUser, applyQueuedTapsToPills } = await import('./lib/loadOrchestration');
+        const tapsForUser = filterTapsForUser(pendingNotifTapsRef.current, userId);
         pendingNotifTapsRef.current = [];
-        if (queuedTaps.length > 0) {
-          queuedTaps.forEach(({ pillId, reminderId }) => {
-            applyTakenMark(pillId, reminderId);
-          });
+        if (tapsForUser.length > 0) {
+          setPills(prevPills => applyQueuedTapsToPills(prevPills, tapsForUser));
         }
       }
     };

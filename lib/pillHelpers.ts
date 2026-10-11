@@ -89,8 +89,15 @@ export const recordMissedDoses = (
     // Determine the earliest date to sweep for this pill
     // Don't mark missed doses for days before the pill was created
     let pillSweepStart = new Date(sweepStartDate);
-    if (pill.createdAt) {
-      const pillCreatedDate = new Date(pill.createdAt);
+    
+    // Use createdAt if available, otherwise fall back to numeric id as timestamp
+    // (pre-this-build pills have timestamp-based IDs like "1728640800000")
+    const pillCreationTime = pill.createdAt ?? (
+      /^\d+$/.test(pill.id) ? parseInt(pill.id, 10) : null
+    );
+    
+    if (pillCreationTime) {
+      const pillCreatedDate = new Date(pillCreationTime);
       pillCreatedDate.setHours(0, 0, 0, 0);
       // Start from the day after creation (can't miss a dose on the day you create the pill)
       // or from sweepStartDate, whichever is later
