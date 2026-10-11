@@ -223,6 +223,10 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   const cloudIdsRef = useRef<Set<string>>(new Set());
   // Notification listener handle for cleanup
   const notifListenerRef = useRef<NotificationListenerHandle | null>(null);
+  // Queue for notification taps that arrive before cloud load completes
+  const pendingNotifTapsRef = useRef<Array<{ pillId: string; reminderId: string; userId: string }>>([]);
+  // Track if missed dose sweep has run after this load
+  const missedSweepDoneRef = useRef(false);
 
   const [pills, setPills] = useState<Pill[]>([]);
 
@@ -236,7 +240,19 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   useEffect(() => { pillsRef.current = pills; }, [pills]);
 
   // ─── Mark taken handler (for notification taps) ─────────────────────────────
+  // If cloud load hasn't completed, queue the tap to apply after load
   const markReminderTaken = useCallback((pillId: string, reminderId: string) => {
+    // If cloud load hasn't succeeded yet, queue the tap for later
+    if (!cloudLoadSucceededRef.current) {
+      pendingNotifTapsRef.current.push({ pillId, reminderId, userId });
+      return;
+    }
+    
+    applyTakenMark(pillId, reminderId);
+  }, [userId]);
+  
+  // Apply taken mark to pills state (used directly and for queued taps)
+  const applyTakenMark = useCallback((pillId: string, reminderId: string) => {
     setPills(prevPills => prevPills.map(pill => {
       if (pill.id === pillId) {
         const history = pill.history || [];
@@ -330,6 +346,8 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       // Reset load state
       cloudLoadSucceededRef.current = false;
       loadedForUserIdRef.current = null;
+      missedSweepDoneRef.current = false;
+      pendingNotifTapsRef.current = [];
       
       // Load from local storage for this user (immediate UI)
       const localPills = loadPillsFromStorage(userId);
@@ -353,16 +371,47 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
         cloudIdsRef.current = newCloudIds;
         saveCloudIdsToStorage(userId, newCloudIds);
         
-        // Use cloud data, enhanced with derived taken status
-        const enhancedPills = enhancePillsWithDerivedStatus(cloudPills);
+        // Run missed dose sweep BEFORE setting pills
+        // This ensures the sweep runs exactly once after each successful cloud load
+        let pillsAfterSweep = cloudPills;
+        const lastSweep = getLastMissedSweepDate(userId);
+        const yesterday = new Date();
+        yesterday.setDate(yesterday.getDate() - 1);
+        const yesterdayStr = getDateString(yesterday);
+        
+        if (lastSweep !== yesterdayStr && cloudPills.length > 0) {
+          const { updatedPills, hasChanges } = recordMissedDoses(cloudPills, lastSweep);
+          if (hasChanges) {
+            pillsAfterSweep = updatedPills;
+          }
+          setLastMissedSweepDate(userId, yesterdayStr);
+        }
+        missedSweepDoneRef.current = true;
+        
+        // Use cloud data (with sweep applied), enhanced with derived taken status
+        const enhancedPills = enhancePillsWithDerivedStatus(pillsAfterSweep);
         setPills(enhancedPills);
         savePillsToStorage(userId, enhancedPills);
+        
+        // Apply any queued notification taps that arrived during load
+        // Filter to only taps for this user (in case of rapid user switch)
+        const queuedTaps = pendingNotifTapsRef.current.filter(tap => tap.userId === userId);
+        pendingNotifTapsRef.current = [];
+        
+        // Apply queued taps after a microtask to ensure state is settled
+        if (queuedTaps.length > 0) {
+          setTimeout(() => {
+            queuedTaps.forEach(({ pillId, reminderId }) => {
+              applyTakenMark(pillId, reminderId);
+            });
+          }, 0);
+        }
         
         // Cancel any existing native notifications and reschedule from cloud data
         // This ensures notifications match the user's actual pills
         if (isNative()) {
           await cancelAllScheduledNotifications();
-          await scheduleAllPillNotifications(cloudPills);
+          await scheduleAllPillNotifications(pillsAfterSweep);
         }
         
         setSyncStatus('synced');
@@ -374,11 +423,21 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
         setSyncStatus('error');
         // DO NOT set cloudLoadSucceededRef.current = true here
         // This prevents destructive sync when load fails
+        
+        // On load failure, apply queued taps to local state so user's action isn't lost
+        // They'll be in localStorage and can sync when connection is restored
+        const queuedTaps = pendingNotifTapsRef.current.filter(tap => tap.userId === userId);
+        pendingNotifTapsRef.current = [];
+        if (queuedTaps.length > 0) {
+          queuedTaps.forEach(({ pillId, reminderId }) => {
+            applyTakenMark(pillId, reminderId);
+          });
+        }
       }
     };
     
     loadCloud();
-  }, [userId]); // Only depends on userId, not user object (S6)
+  }, [userId, applyTakenMark]); // Only depends on userId, not user object (S6)
 
   // ─── Persist to localStorage (user-scoped) ──────────────────────────────────
   useEffect(() => {
@@ -512,29 +571,6 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
     return () => clearInterval(interval);
   }, []);
 
-  // ─── Missed dose sweep on load (covers all days since last sweep) ───────────
-  useEffect(() => {
-    if (!cloudLoadSucceededRef.current) return;
-    if (pills.length === 0) return;
-    
-    const lastSweep = getLastMissedSweepDate(userId);
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    const yesterdayStr = getDateString(yesterday);
-    
-    // Only sweep if we haven't swept up to yesterday
-    if (lastSweep === yesterdayStr) return;
-    
-    const { updatedPills, hasChanges } = recordMissedDoses(pills, lastSweep);
-    
-    if (hasChanges) {
-      setPills(updatedPills);
-    }
-    
-    // Mark that we've swept up to yesterday
-    setLastMissedSweepDate(userId, yesterdayStr);
-  }, [userId, pills.length]);
-
   // ─── Due reminder check (fires at each minute boundary) ─────────────────────
   useEffect(() => {
     let intervalId: number | undefined;
@@ -622,7 +658,8 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
         }
       }
     } else {
-      savedPill = { ...pillData, id: Date.now().toString(), history: [] };
+      const now = Date.now();
+      savedPill = { ...pillData, id: now.toString(), history: [], createdAt: now };
       savedPill.reminders = savedPill.reminders.map(r => ({
         ...r,
         taken: false,

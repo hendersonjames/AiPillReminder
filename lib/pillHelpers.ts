@@ -45,6 +45,8 @@ export const getReminderTakenStatus = (
 
 // ─── Multi-day missed dose sweep ──────────────────────────────────────────────
 // Covers all days from lastSweepDate to yesterday (inclusive)
+// Skips days before a pill's createdAt to avoid marking missed doses for days
+// before the pill existed.
 
 export interface MissedDoseResult {
   updatedPills: Pill[];
@@ -70,7 +72,7 @@ export const recordMissedDoses = (
     sweepStartDate.setDate(sweepStartDate.getDate() + 1);
   } else {
     // If never swept, just do yesterday
-    sweepStartDate = yesterday;
+    sweepStartDate = new Date(yesterday);
   }
   
   // Don't sweep future dates or today
@@ -84,8 +86,23 @@ export const recordMissedDoses = (
     const newHistory = [...(pill.history || [])];
     let pillHasChanges = false;
 
-    // Iterate through each day from sweepStartDate to yesterday
-    const currentDate = new Date(sweepStartDate);
+    // Determine the earliest date to sweep for this pill
+    // Don't mark missed doses for days before the pill was created
+    let pillSweepStart = new Date(sweepStartDate);
+    if (pill.createdAt) {
+      const pillCreatedDate = new Date(pill.createdAt);
+      pillCreatedDate.setHours(0, 0, 0, 0);
+      // Start from the day after creation (can't miss a dose on the day you create the pill)
+      // or from sweepStartDate, whichever is later
+      const dayAfterCreation = new Date(pillCreatedDate);
+      dayAfterCreation.setDate(dayAfterCreation.getDate() + 1);
+      if (dayAfterCreation > pillSweepStart) {
+        pillSweepStart = dayAfterCreation;
+      }
+    }
+
+    // Iterate through each day from pillSweepStart to yesterday
+    const currentDate = new Date(pillSweepStart);
     while (currentDate <= yesterday) {
       const dayOfWeek = currentDate.getDay();
       const dateStr = getDateString(currentDate);

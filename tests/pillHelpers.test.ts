@@ -234,6 +234,85 @@ describe('pillHelpers', () => {
       const missedEntries = result.updatedPills[0].history?.filter(h => h.action === 'missed') || [];
       expect(missedEntries.length).toBe(1);
     });
+
+    it('skips days before pill createdAt (H3 fix)', () => {
+      // Create a pill that was created 2 days ago
+      const twoDaysAgo = new Date();
+      twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
+      twoDaysAgo.setHours(12, 0, 0, 0);
+      
+      const pillWithCreatedAt: Pill = {
+        ...createPill('p1', 'New Pill', [
+          { id: 'r1', time: '09:00', daysOfWeek: [0, 1, 2, 3, 4, 5, 6], taken: false },
+        ]),
+        createdAt: twoDaysAgo.getTime(),
+      };
+
+      // Set lastSweep to a week ago - without createdAt check, this would create 6 missed entries
+      const weekAgo = new Date();
+      weekAgo.setDate(weekAgo.getDate() - 7);
+      const lastSweepStr = getDateString(weekAgo);
+
+      const result = recordMissedDoses([pillWithCreatedAt], lastSweepStr);
+
+      // Should only have missed entries for yesterday (day after creation is 1 day ago, yesterday is also 1 day ago)
+      // Pill created 2 days ago -> can miss starting 1 day ago (day after creation) -> only yesterday
+      const missedEntries = result.updatedPills[0].history?.filter(h => h.action === 'missed') || [];
+      expect(missedEntries.length).toBe(1);
+      
+      // Verify the missed entry is for yesterday
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = getDateString(yesterday);
+      expect(missedEntries[0].id).toContain(yesterdayStr);
+    });
+
+    it('does not mark missed for pill created today', () => {
+      const now = new Date();
+      now.setHours(12, 0, 0, 0);
+      
+      const pillCreatedToday: Pill = {
+        ...createPill('p1', 'Brand New Pill', [
+          { id: 'r1', time: '09:00', daysOfWeek: [0, 1, 2, 3, 4, 5, 6], taken: false },
+        ]),
+        createdAt: now.getTime(),
+      };
+
+      // Even with a week-old lastSweep, should not mark any missed doses
+      const weekAgo = new Date();
+      weekAgo.setDate(weekAgo.getDate() - 7);
+      const lastSweepStr = getDateString(weekAgo);
+
+      const result = recordMissedDoses([pillCreatedToday], lastSweepStr);
+
+      // No missed entries - pill was just created
+      expect(result.hasChanges).toBe(false);
+      const missedEntries = result.updatedPills[0].history?.filter(h => h.action === 'missed') || [];
+      expect(missedEntries.length).toBe(0);
+    });
+
+    it('does not mark missed for pill created yesterday', () => {
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      yesterday.setHours(12, 0, 0, 0);
+      
+      const pillCreatedYesterday: Pill = {
+        ...createPill('p1', 'Yesterday Pill', [
+          { id: 'r1', time: '09:00', daysOfWeek: [0, 1, 2, 3, 4, 5, 6], taken: false },
+        ]),
+        createdAt: yesterday.getTime(),
+      };
+
+      // Sweep from a week ago
+      const weekAgo = new Date();
+      weekAgo.setDate(weekAgo.getDate() - 7);
+      const lastSweepStr = getDateString(weekAgo);
+
+      const result = recordMissedDoses([pillCreatedYesterday], lastSweepStr);
+
+      // No missed - can only start missing the day AFTER creation, which is today (not sweepable)
+      expect(result.hasChanges).toBe(false);
+    });
   });
 
   describe('removeLatestTakenEntry', () => {
