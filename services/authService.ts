@@ -97,6 +97,20 @@ export const signOut = async (
   return { success: true, localOnly: false };
 };
 
+export const resetPasswordForEmail = async (email: string) => {
+  const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
+    redirectTo: `${window.location.origin}/reset-password`,
+  });
+  if (error) throw error;
+  return data;
+};
+
+export const updatePassword = async (newPassword: string) => {
+  const { data, error } = await supabase.auth.updateUser({ password: newPassword });
+  if (error) throw error;
+  return data;
+};
+
 // Wipe user data without signing out (for SIGNED_OUT events from other sources)
 export const cleanupUserData = async (userId: string): Promise<void> => {
   await cancelAllScheduledNotifications();

@@ -5,6 +5,7 @@ import PillList from './components/PillList';
 import AddPillModal from './components/AddPillModal';
 import ChatModal from './components/ChatModal';
 import Auth from './components/Auth';
+import ResetPassword from './components/ResetPassword';
 import DoctorReport from './components/DoctorReport';
 import { ChatIcon, PlusIcon } from './components/icons/Icons';
 import { playSound } from './services/soundService';
@@ -82,6 +83,7 @@ const App: React.FC = () => {
   const [user, setUser] = useState<User | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
+  const [isPasswordRecovery, setIsPasswordRecovery] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
   
   // Track previous user ID to detect user switches
@@ -96,6 +98,16 @@ const App: React.FC = () => {
     const { data: { subscription } } = onAuthStateChange(async (currentUser, event) => {
       const currentUserId = currentUser?.id ?? null;
       const prevUserId = prevUserIdRef.current;
+      
+      // Detect password recovery flow (user clicked reset link from email)
+      if (event === 'PASSWORD_RECOVERY') {
+        setIsPasswordRecovery(true);
+        prevUserIdRef.current = currentUserId;
+        setUserId(currentUserId);
+        setUser(currentUser);
+        setAuthLoading(false);
+        return;
+      }
       
       // Handle sign-out from ANY source (button, expiry, another tab, revocation)
       if (event === 'SIGNED_OUT') {
@@ -129,14 +141,14 @@ const App: React.FC = () => {
       setUser(currentUser);
       setAuthLoading(false);
       
-      if (currentUser) {
+      if (currentUser && !isPasswordRecovery) {
         // Request notification permission — native or web
         await requestNotificationPermission();
         if (!isNative()) await requestWebNotificationPermission();
       }
     });
     return () => subscription.unsubscribe();
-  }, []);
+  }, [isPasswordRecovery]);
 
   const handleSignOut = useCallback(async () => {
     const currentUserId = prevUserIdRef.current;
@@ -177,6 +189,11 @@ const App: React.FC = () => {
         <div className="text-slate-500">Loading...</div>
       </div>
     );
+  }
+
+  // Show password reset screen when user clicked recovery link from email
+  if (isPasswordRecovery && user) {
+    return <ResetPassword onComplete={() => setIsPasswordRecovery(false)} />;
   }
 
   if (!user || !userId) return <Auth />;
