@@ -813,10 +813,10 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       </div>
 
       {isAddPillModalOpen && (
-        <AddPillModal onClose={closeModal} onSavePill={savePill} pillToEdit={pillToEdit} />
+        <AddPillModal onClose={closeModal} onSavePill={savePill} pillToEdit={pillToEdit} userId={user?.id} />
       )}
       {isChatModalOpen && (
-        <ChatModal onClose={() => setChatModalOpen(false)} />
+        <ChatModal onClose={() => setChatModalOpen(false)} userId={user?.id} />
       )}
       {isReportOpen && (
         <DoctorReport pills={displayPills} onClose={() => setReportOpen(false)} />

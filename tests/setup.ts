@@ -1,5 +1,7 @@
-import '@testing-library/jest-dom';
+import '@testing-library/jest-dom/vitest';
 import { vi, beforeEach } from 'vitest';
+
+Element.prototype.scrollIntoView = vi.fn();
 
 // Mock localStorage
 const localStorageMock = (() => {
@@ -31,3 +33,5 @@ beforeEach(() => {
   localStorageMock.clear();
   vi.clearAllMocks();
 });
+
+export { localStorageMock };
