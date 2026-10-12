@@ -42,16 +42,19 @@ Copy `.env.example` to `.env.local` and fill in your values:
 |----------|----------|-------------|
 | `VITE_SUPABASE_URL` | Yes | Your Supabase project URL |
 | `VITE_SUPABASE_PUBLISHABLE_KEY` | Yes | Your Supabase anon/public key |
-| `GEMINI_API_KEY` | No | Google Gemini API key (enables AI features) |
+| `GEMINI_API_KEY` | No | Google Gemini API key (enables AI features, server-side only) |
+| `VITE_API_BASE_URL` | No | API base URL for Capacitor native builds (e.g., `https://ai-pill-reminder.vercel.app`) |
 
 **Note:** The app will load and function without `GEMINI_API_KEY`, but AI features (chat, medication suggestions) will show friendly "not configured" messages.
+
+**Security:** The `GEMINI_API_KEY` is only used server-side in the `/api/gemini` Vercel function. It is never exposed to the client browser.
 
 ### Vercel Deployment
 
 Set these environment variables in your Vercel project settings:
 - `VITE_SUPABASE_URL`
 - `VITE_SUPABASE_PUBLISHABLE_KEY`
-- `GEMINI_API_KEY`
+- `GEMINI_API_KEY` (server-side only, used by the `/api/gemini` serverless function)
 
 ### Supabase Setup
 

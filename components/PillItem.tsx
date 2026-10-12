@@ -211,13 +211,15 @@ const PillItem: React.FC<PillItemProps> = ({ pill, onToggleTaken, onDeletePill, 
                         <div className="flex-shrink-0 mt-0.5">
                             {entry.action === 'taken' ? (
                             <CheckCircleIcon className="w-5 h-5 text-sky-500" />
+                            ) : entry.action === 'missed' ? (
+                            <CircleIcon className="w-5 h-5 text-red-500" />
                             ) : (
-                            <SnoozeIcon className="w-5 h-5 text-red-500" />
+                            <SnoozeIcon className="w-5 h-5 text-amber-500" />
                             )}
                         </div>
                         <div>
                             <p className="font-semibold text-sm text-slate-700">
-                            {entry.action === 'taken' ? 'Marked as Taken' : 'Reminder Snoozed'}
+                            {entry.action === 'taken' ? 'Marked as Taken' : entry.action === 'missed' ? 'Dose Missed' : 'Reminder Snoozed'}
                             <span className="font-normal text-slate-500"> at {formatTime12Hour(entry.time)}</span>
                             </p>
                             <p className="text-xs text-slate-500">

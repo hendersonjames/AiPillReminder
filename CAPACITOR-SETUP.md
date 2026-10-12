@@ -132,9 +132,13 @@ on every push to `main`.
 2. Add these secrets:
    - `VITE_SUPABASE_URL` → your Supabase project URL
    - `VITE_SUPABASE_PUBLISHABLE_KEY` → your Supabase anon/public key
-   - `GEMINI_API_KEY` → your Gemini API key (optional, for AI features)
 3. Push any change to `main`
 4. Go to Actions tab → download the APK from Artifacts
+
+**Note on AI features:** The Gemini API key is server-only and must never be
+included in client builds or CI secrets for native apps. The workflow sets
+`VITE_API_BASE_URL` to point native builds at the server endpoint that handles
+AI requests securely.
 
 ---
 

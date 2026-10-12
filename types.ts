@@ -16,13 +16,14 @@ export interface HistoryEntry {
 }
 
 export interface Pill {
-  id:string;
+  id: string;
   name: string;
   dosage: string;
   notes?: string;
   notificationSound?: string;
   reminders: Reminder[];
   history?: HistoryEntry[];
+  createdAt?: number; // Timestamp when the pill was created (local device time)
 }
 
 export enum MessageAuthor {
