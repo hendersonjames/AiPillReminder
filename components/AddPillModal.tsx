@@ -1,13 +1,23 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { Pill, Reminder } from '../types';
+import React, { useState, useEffect } from 'react';
+import { Pill } from '../types';
 import { getQuickSuggestion } from '../services/geminiService';
 import { soundOptions } from '../services/soundService';
 import { CloseIcon, PlusIcon, SparklesIcon, TrashIcon } from './icons/Icons';
+import {
+  hasAIConsent,
+  grantAIConsent,
+  declineAIConsent,
+  resetAIConsent,
+  getAIConsentStatus,
+  ConsentStatus,
+} from '../services/aiConsentService';
+import AIConsentDialog from './AIConsentDialog';
 
 interface AddPillModalProps {
   onClose: () => void;
   onSavePill: (pill: Omit<Pill, 'id' | 'history'> | Pill) => void;
   pillToEdit?: Pill;
+  userId: string | undefined;
 }
 
 // A simple debounce hook
@@ -54,9 +64,15 @@ interface ReminderFormData {
   daysOfWeek: number[];
 }
 
-const AddPillModal: React.FC<AddPillModalProps> = ({ onClose, onSavePill, pillToEdit }) => {
+const AddPillModal: React.FC<AddPillModalProps> = ({ onClose, onSavePill, pillToEdit, userId }) => {
   const isEditMode = !!pillToEdit;
   
+  const [consentStatus, setConsentStatus] = useState<ConsentStatus>(() =>
+    getAIConsentStatus(userId)
+  );
+  const [showConsentDialog, setShowConsentDialog] = useState(false);
+  const consentGranted = consentStatus === 'granted';
+
   const [name, setName] = useState(pillToEdit?.name || '');
   const [dosage, setDosage] = useState(pillToEdit?.dosage || '');
   const [notes, setNotes] = useState(pillToEdit?.notes || '');
@@ -70,7 +86,32 @@ const AddPillModal: React.FC<AddPillModalProps> = ({ onClose, onSavePill, pillTo
 
   const debouncedName = useDebounce(name, 500);
 
+  const handleAcceptConsent = () => {
+    if (!userId) return;
+    grantAIConsent(userId);
+    setConsentStatus('granted');
+    setShowConsentDialog(false);
+  };
+
+  const handleDeclineConsent = () => {
+    if (!userId) return;
+    declineAIConsent(userId);
+    setConsentStatus('declined');
+    setShowConsentDialog(false);
+  };
+
+  const handleEnableSuggestions = () => {
+    if (!userId) return;
+    resetAIConsent(userId);
+    setConsentStatus('unknown');
+    setShowConsentDialog(true);
+  };
+
   useEffect(() => {
+    if (!consentGranted) {
+      setSuggestion('');
+      return;
+    }
     if (debouncedName && debouncedName !== pillToEdit?.name) {
       setSuggestionLoading(true);
       getQuickSuggestion(debouncedName).then(res => {
@@ -80,7 +121,7 @@ const AddPillModal: React.FC<AddPillModalProps> = ({ onClose, onSavePill, pillTo
     } else {
       setSuggestion('');
     }
-  }, [debouncedName, pillToEdit?.name]);
+  }, [debouncedName, pillToEdit?.name, consentGranted]);
 
   const handleAddTime = () => {
     setReminders([...reminders, { time: '17:00', daysOfWeek: [0, 1, 2, 3, 4, 5, 6] }]);
@@ -137,6 +178,13 @@ const AddPillModal: React.FC<AddPillModalProps> = ({ onClose, onSavePill, pillTo
   };
 
   return (
+    <>
+    {showConsentDialog && (
+      <AIConsentDialog
+        onAccept={handleAcceptConsent}
+        onDecline={handleDeclineConsent}
+      />
+    )}
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md m-auto transform transition-all duration-300 scale-100 animate-fade-in-up max-h-[90vh] overflow-y-auto">
         <div className="p-6">
@@ -163,12 +211,21 @@ const AddPillModal: React.FC<AddPillModalProps> = ({ onClose, onSavePill, pillTo
                 className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500"
                 required
               />
-              {isSuggestionLoading && <p className="text-sm text-slate-400 mt-2">Getting info...</p>}
-              {suggestion && !isSuggestionLoading && (
+              {consentGranted && isSuggestionLoading && <p className="text-sm text-slate-400 mt-2">Getting info...</p>}
+              {consentGranted && suggestion && !isSuggestionLoading && (
                 <div className="mt-2 text-sm flex items-start p-2 bg-sky-50 rounded-md text-sky-700">
                   <SparklesIcon className="w-4 h-4 mr-2 mt-0.5 flex-shrink-0" />
                   <span>{suggestion}</span>
                 </div>
+              )}
+              {!consentGranted && name.trim() && (
+                <button
+                  type="button"
+                  onClick={handleEnableSuggestions}
+                  className="mt-2 text-xs text-sky-500 hover:text-sky-600 underline"
+                >
+                  Enable AI suggestions
+                </button>
               )}
             </div>
             <div>
@@ -264,6 +321,7 @@ const AddPillModal: React.FC<AddPillModalProps> = ({ onClose, onSavePill, pillTo
           }
         `}</style>
     </div>
+    </>
   );
 };
 

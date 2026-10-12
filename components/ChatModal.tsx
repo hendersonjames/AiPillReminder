@@ -1,15 +1,36 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { ChatMessage, MessageAuthor } from '../types';
 import { getChatResponse } from '../services/geminiService';
-import { CloseIcon, SendIcon, UserIcon, BotIcon, BrainIcon } from './icons/Icons';
+import { CloseIcon, SendIcon, UserIcon, BotIcon, BrainIcon, SparklesIcon } from './icons/Icons';
+import {
+  grantAIConsent,
+  declineAIConsent,
+  resetAIConsent,
+  revokeAIConsent,
+  ConsentStatus,
+  getAIConsentStatus,
+} from '../services/aiConsentService';
+import AIConsentDialog from './AIConsentDialog';
 
 interface ChatModalProps {
   onClose: () => void;
+  userId: string | undefined;
 }
 
-const ChatModal: React.FC<ChatModalProps> = ({ onClose }) => {
+const ChatModal: React.FC<ChatModalProps> = ({ onClose, userId }) => {
+  const [consentStatus, setConsentStatus] = useState<ConsentStatus>(() =>
+    getAIConsentStatus(userId)
+  );
+  const [showConsentDialog, setShowConsentDialog] = useState(() =>
+    getAIConsentStatus(userId) === 'unknown'
+  );
+  const hasConsent = consentStatus === 'granted';
+
   const [messages, setMessages] = useState<ChatMessage[]>([
-    { author: MessageAuthor.BOT, text: "Hello! I'm ChronaCare's AI assistant. How can I help you today? Remember, I'm not a doctor, so please consult a healthcare professional for medical advice." }
+    { author: MessageAuthor.BOT, text: hasConsent
+      ? "Hello! I'm ChronaCare's AI assistant. How can I help you today? Remember, I'm not a doctor, so please consult a healthcare professional for medical advice."
+      : "AI features are currently disabled. Enable them below to start chatting!"
+    }
   ]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -24,8 +45,42 @@ const ChatModal: React.FC<ChatModalProps> = ({ onClose }) => {
     scrollToBottom();
   }, [messages]);
 
+  const handleAcceptConsent = () => {
+    if (!userId) return;
+    grantAIConsent(userId);
+    setConsentStatus('granted');
+    setShowConsentDialog(false);
+    setMessages([
+      { author: MessageAuthor.BOT, text: "Hello! I'm ChronaCare's AI assistant. How can I help you today? Remember, I'm not a doctor, so please consult a healthcare professional for medical advice." }
+    ]);
+  };
+
+  const handleDeclineConsent = () => {
+    if (!userId) return;
+    declineAIConsent(userId);
+    setConsentStatus('declined');
+    setShowConsentDialog(false);
+  };
+
+  const handleReopenConsent = () => {
+    if (!userId) return;
+    resetAIConsent(userId);
+    setConsentStatus('unknown');
+    setShowConsentDialog(true);
+  };
+
+  const handleRevokeConsent = () => {
+    if (!userId) return;
+    revokeAIConsent(userId);
+    setConsentStatus('unknown');
+    setMessages([
+      { author: MessageAuthor.BOT, text: "AI features are currently disabled. Enable them below to start chatting!" }
+    ]);
+    setShowConsentDialog(true);
+  };
+
   const handleSend = async () => {
-    if (!input.trim() || isLoading) return;
+    if (!input.trim() || isLoading || !hasConsent) return;
 
     const userMessage: ChatMessage = { author: MessageAuthor.USER, text: input };
     setMessages(prev => [...prev, userMessage]);
@@ -47,6 +102,13 @@ const ChatModal: React.FC<ChatModalProps> = ({ onClose }) => {
 
 
   return (
+    <>
+    {showConsentDialog && (
+      <AIConsentDialog
+        onAccept={handleAcceptConsent}
+        onDecline={handleDeclineConsent}
+      />
+    )}
     <div className="fixed inset-0 bg-black bg-opacity-50 flex flex-col items-center justify-end z-50 p-0 sm:p-4">
       <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-2xl h-full sm:h-[90vh] flex flex-col transform transition-all duration-300 animate-fade-in-up">
         <header className="p-4 border-b border-slate-200 flex justify-between items-center flex-shrink-0">
@@ -123,30 +185,54 @@ const ChatModal: React.FC<ChatModalProps> = ({ onClose }) => {
         </div>
 
         <footer className="p-4 border-t border-slate-200 flex-shrink-0">
-          <div className="flex items-center gap-2">
-            <input
-              type="text"
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="Ask a question..."
-              className="w-full px-4 py-2 border border-slate-300 rounded-full focus:ring-2 focus:ring-sky-500 focus:border-sky-500"
-              disabled={isLoading}
-            />
-            <div className="relative group">
-                <button
-                  onClick={handleSend}
-                  disabled={isLoading || !input.trim()}
-                  className="bg-sky-500 text-white rounded-full p-3 shadow-sm hover:bg-sky-600 disabled:bg-slate-300 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-sky-500 transition-colors"
-                  aria-label="Send message"
-                >
-                  <SendIcon className="w-5 h-5" />
-                </button>
-                <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 text-xs font-semibold text-white bg-gray-700 rounded-md opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-10">
-                    Send
-                </span>
+          {!hasConsent ? (
+            <div className="text-center space-y-3">
+              <p className="text-sm text-slate-500">
+                AI features require your consent to send medication data to Google's AI.
+              </p>
+              <button
+                onClick={handleReopenConsent}
+                className="text-sm font-medium text-sky-500 hover:text-sky-600 underline"
+              >
+                Enable AI Features
+              </button>
             </div>
-          </div>
+          ) : (
+            <>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={input}
+                  onChange={e => setInput(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder="Ask a question..."
+                  className="w-full px-4 py-2 border border-slate-300 rounded-full focus:ring-2 focus:ring-sky-500 focus:border-sky-500"
+                  disabled={isLoading}
+                />
+                <div className="relative group">
+                    <button
+                      onClick={handleSend}
+                      disabled={isLoading || !input.trim()}
+                      className="bg-sky-500 text-white rounded-full p-3 shadow-sm hover:bg-sky-600 disabled:bg-slate-300 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-sky-500 transition-colors"
+                      aria-label="Send message"
+                    >
+                      <SendIcon className="w-5 h-5" />
+                    </button>
+                    <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 text-xs font-semibold text-white bg-gray-700 rounded-md opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-10">
+                        Send
+                    </span>
+                </div>
+              </div>
+              <div className="mt-2 text-center">
+                <button
+                  onClick={handleRevokeConsent}
+                  className="text-xs text-slate-400 hover:text-slate-600"
+                >
+                  AI Privacy Settings
+                </button>
+              </div>
+            </>
+          )}
         </footer>
       </div>
       <style>{`
@@ -177,6 +263,7 @@ const ChatModal: React.FC<ChatModalProps> = ({ onClose }) => {
           }
         `}</style>
     </div>
+    </>
   );
 };
 
