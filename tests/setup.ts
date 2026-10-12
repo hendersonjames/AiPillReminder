@@ -1,8 +1,9 @@
 import '@testing-library/jest-dom/vitest';
-import { vi } from 'vitest';
+import { vi, beforeEach } from 'vitest';
 
 Element.prototype.scrollIntoView = vi.fn();
 
+// Mock localStorage
 const localStorageMock = (() => {
   let store: Record<string, string> = {};
   return {
@@ -25,6 +26,12 @@ const localStorageMock = (() => {
 
 Object.defineProperty(window, 'localStorage', {
   value: localStorageMock,
+});
+
+// Reset localStorage between tests
+beforeEach(() => {
+  localStorageMock.clear();
+  vi.clearAllMocks();
 });
 
 export { localStorageMock };
