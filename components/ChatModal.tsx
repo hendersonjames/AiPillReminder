@@ -28,7 +28,7 @@ const ChatModal: React.FC<ChatModalProps> = ({ onClose, userId }) => {
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     { author: MessageAuthor.BOT, text: hasConsent
-      ? "Hello! I'm ChronaCare's AI assistant. How can I help you today? Remember, I'm not a doctor, so please consult a healthcare professional for medical advice."
+      ? "Hello! I'm Remedí's AI assistant. How can I help you today? Remember, I'm not a doctor, so please consult a healthcare professional for medical advice."
       : "AI features are currently disabled. Enable them below to start chatting!"
     }
   ]);
@@ -51,7 +51,7 @@ const ChatModal: React.FC<ChatModalProps> = ({ onClose, userId }) => {
     setConsentStatus('granted');
     setShowConsentDialog(false);
     setMessages([
-      { author: MessageAuthor.BOT, text: "Hello! I'm ChronaCare's AI assistant. How can I help you today? Remember, I'm not a doctor, so please consult a healthcare professional for medical advice." }
+      { author: MessageAuthor.BOT, text: "Hello! I'm Remedí's AI assistant. How can I help you today? Remember, I'm not a doctor, so please consult a healthcare professional for medical advice." }
     ]);
   };
 

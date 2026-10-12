@@ -8,11 +8,16 @@ describe('AIConsentDialog', () => {
     expect(screen.getByText('Enable AI Features?')).toBeInTheDocument();
   });
 
+  it('uses Remedí branding', () => {
+    render(<AIConsentDialog onAccept={vi.fn()} onDecline={vi.fn()} />);
+    expect(screen.getByText(/Remedí's AI features/)).toBeInTheDocument();
+  });
+
   it('displays information about data sharing', () => {
     render(<AIConsentDialog onAccept={vi.fn()} onDecline={vi.fn()} />);
-    expect(screen.getByText('What data is shared:')).toBeInTheDocument();
+    expect(screen.getByText(/What data is shared with Google/)).toBeInTheDocument();
     expect(screen.getByText(/Pill names you enter/)).toBeInTheDocument();
-    expect(screen.getByText(/Messages you send in AI chat/)).toBeInTheDocument();
+    expect(screen.getByText(/Messages and conversation history/)).toBeInTheDocument();
   });
 
   it('has a link to Google Privacy Policy', () => {
@@ -41,5 +46,23 @@ describe('AIConsentDialog', () => {
   it('mentions ability to change choice later', () => {
     render(<AIConsentDialog onAccept={vi.fn()} onDecline={vi.fn()} />);
     expect(screen.getByText(/You can change your choice anytime/)).toBeInTheDocument();
+  });
+
+  it('warns about free-form text in chat', () => {
+    render(<AIConsentDialog onAccept={vi.fn()} onDecline={vi.fn()} />);
+    expect(screen.getByText(/chat is free-form text/)).toBeInTheDocument();
+  });
+
+  it('renders via portal to document.body', () => {
+    render(<AIConsentDialog onAccept={vi.fn()} onDecline={vi.fn()} />);
+    const overlay = screen.getByTestId('ai-consent-dialog-overlay');
+    expect(overlay.parentElement).toBe(document.body);
+  });
+
+  it('has z-index higher than 50 (modal z-index)', () => {
+    render(<AIConsentDialog onAccept={vi.fn()} onDecline={vi.fn()} />);
+    const overlay = screen.getByTestId('ai-consent-dialog-overlay');
+    const style = window.getComputedStyle(overlay);
+    expect(parseInt(style.zIndex, 10)).toBeGreaterThan(50);
   });
 });

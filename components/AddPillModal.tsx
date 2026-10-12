@@ -4,10 +4,10 @@ import { getQuickSuggestion } from '../services/geminiService';
 import { soundOptions } from '../services/soundService';
 import { CloseIcon, PlusIcon, SparklesIcon, TrashIcon } from './icons/Icons';
 import {
-  hasAIConsent,
   grantAIConsent,
   declineAIConsent,
   resetAIConsent,
+  revokeAIConsent,
   getAIConsentStatus,
   ConsentStatus,
 } from '../services/aiConsentService';
@@ -104,6 +104,14 @@ const AddPillModal: React.FC<AddPillModalProps> = ({ onClose, onSavePill, pillTo
     if (!userId) return;
     resetAIConsent(userId);
     setConsentStatus('unknown');
+    setShowConsentDialog(true);
+  };
+
+  const handleRevokeConsent = () => {
+    if (!userId) return;
+    revokeAIConsent(userId);
+    setConsentStatus('unknown');
+    setSuggestion('');
     setShowConsentDialog(true);
   };
 
@@ -302,6 +310,17 @@ const AddPillModal: React.FC<AddPillModalProps> = ({ onClose, onSavePill, pillTo
             <button type="submit" className="w-full bg-sky-500 text-white font-bold py-3 px-4 rounded-lg hover:bg-sky-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-sky-500 transition-colors">
               {isEditMode ? 'Update Pill' : 'Save Pill'}
             </button>
+            {consentGranted && (
+              <div className="mt-3 text-center">
+                <button
+                  type="button"
+                  onClick={handleRevokeConsent}
+                  className="text-xs text-slate-400 hover:text-slate-600"
+                >
+                  AI Privacy Settings
+                </button>
+              </div>
+            )}
           </form>
         </div>
       </div>

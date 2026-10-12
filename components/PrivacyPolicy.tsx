@@ -47,7 +47,14 @@ const PrivacyPolicy: React.FC<{ onClose: () => void }> = ({ onClose }) => {
               Your data is stored on Supabase, a trusted cloud database provider. All data is encrypted at rest and in transit using industry-standard TLS encryption. Your medication data is protected by Row Level Security — meaning only you can access your own records. Not even we can read your individual medication data without your account credentials.
             </p>
             <p>
-              We use Google's Gemini AI to provide real-time medication suggestions as you type. When you search for a medication, the name you type is sent to Google's AI service to generate helpful information. This is the only instance where any data leaves our own servers. Google's data handling is governed by their privacy policy.
+              We use Google's Gemini AI to power our AI features. <strong>With your explicit consent</strong>, the following data is sent to Google's AI service:
+            </p>
+            <ul className="space-y-2 list-none mt-2 mb-3">
+              <li className="flex gap-2"><span className="text-sky-500 font-bold">•</span><span><strong>Pill name suggestions</strong> — when you type a medication name, it is sent to generate helpful information about that medication.</span></li>
+              <li className="flex gap-2"><span className="text-sky-500 font-bold">•</span><span><strong>AI chat messages</strong> — messages you send in the AI chat, along with your conversation history within that session, are sent to generate responses.</span></li>
+            </ul>
+            <p>
+              You will be prompted to consent before any data is sent. You can revoke this consent at any time using the "AI Privacy" link near the AI features. Google's data handling is governed by their privacy policy.
             </p>
           </section>
 

@@ -1,5 +1,6 @@
 import React from 'react';
-import { SparklesIcon, CloseIcon } from './icons/Icons';
+import { createPortal } from 'react-dom';
+import { SparklesIcon } from './icons/Icons';
 
 interface AIConsentDialogProps {
   onAccept: () => void;
@@ -7,9 +8,16 @@ interface AIConsentDialogProps {
 }
 
 const AIConsentDialog: React.FC<AIConsentDialogProps> = ({ onAccept, onDecline }) => {
-  return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md m-auto transform transition-all duration-300 animate-fade-in-up">
+  const dialogContent = (
+    <div
+      data-testid="ai-consent-dialog-overlay"
+      className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4"
+      style={{ zIndex: 9999 }}
+    >
+      <div
+        data-testid="ai-consent-dialog"
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-md m-auto transform transition-all duration-300 animate-fade-in-up"
+      >
         <div className="p-6">
           <div className="flex items-center gap-3 mb-4">
             <div className="w-12 h-12 rounded-full bg-sky-100 flex items-center justify-center">
@@ -20,15 +28,15 @@ const AIConsentDialog: React.FC<AIConsentDialogProps> = ({ onAccept, onDecline }
 
           <div className="space-y-4 text-slate-600 text-sm">
             <p>
-              ChronaCare's AI features use Google's Gemini AI to provide helpful information
+              Remedí's AI features use Google's Gemini AI to provide helpful information
               about your medications and answer your questions.
             </p>
 
             <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
-              <p className="font-medium text-amber-800 mb-1">What data is shared:</p>
+              <p className="font-medium text-amber-800 mb-1">What data is shared with Google:</p>
               <ul className="list-disc list-inside text-amber-700 space-y-1">
                 <li>Pill names you enter (for AI suggestions)</li>
-                <li>Messages you send in AI chat</li>
+                <li>Messages and conversation history in AI chat</li>
               </ul>
             </div>
 
@@ -43,7 +51,8 @@ const AIConsentDialog: React.FC<AIConsentDialogProps> = ({ onAccept, onDecline }
               >
                 Privacy Policy
               </a>
-              . No other personal or health information is shared.
+              . Note that chat is free-form text, so avoid entering sensitive personal
+              information in your messages.
             </p>
 
             <p className="text-slate-500">
@@ -84,6 +93,8 @@ const AIConsentDialog: React.FC<AIConsentDialogProps> = ({ onAccept, onDecline }
       `}</style>
     </div>
   );
+
+  return createPortal(dialogContent, document.body);
 };
 
 export default AIConsentDialog;
