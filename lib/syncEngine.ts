@@ -38,6 +38,20 @@ export const mergePills = (
     const inOutbox = outboxIds.has(localPill.id);
     const outboxEntry = outboxByPillId.get(localPill.id);
 
+    // TOMBSTONE-WINS RULE: If cloud has a tombstone for this pill,
+    // it cannot be revived by local non-delete edits from stale clients.
+    // Only a local delete (also a tombstone) can match it.
+    if (cloudPill?.deleted) {
+      // Cloud has tombstone - pill stays deleted regardless of local state
+      // unless local also has a newer delete tombstone in outbox
+      if (inOutbox && outboxEntry?.type === 'delete') {
+        // Both deleted - keep the tombstone for sync
+        merged.push(localPill.deleted ? localPill : cloudPill);
+      }
+      // Otherwise, do nothing - tombstone wins, pill is gone
+      continue;
+    }
+
     if (localPill.deleted) {
       if (inOutbox) {
         merged.push(localPill);
@@ -67,6 +81,7 @@ export const mergePills = (
   }
 
   for (const cloudPill of cloudPills) {
+    // Skip tombstones and already-seen pills
     if (!seenIds.has(cloudPill.id) && !cloudPill.deleted) {
       merged.push(cloudPill);
     }
@@ -120,19 +135,43 @@ export const upsertPillToCloud = async (
   return { success: true };
 };
 
+// Soft-delete: upsert with deleted tombstone instead of hard DELETE
+// This prevents resurrection from stale browsers that still have the pill
+// Tombstone-wins: a tombstoned row cannot be revived by a non-delete edit
 export const deletePillFromCloudById = async (
   pillId: string,
-  expectedUserId: string
+  expectedUserId: string,
+  pill?: Pill
 ): Promise<SyncResult> => {
   if (!await verifySessionUser(expectedUserId)) {
     return { success: false, error: 'User changed', aborted: true };
   }
 
-  const { error } = await supabase
-    .from('pills')
-    .delete()
-    .eq('id', pillId)
-    .eq('user_id', expectedUserId);
+  const now = Date.now();
+  const tombstone: Pill = pill ? {
+    ...pill,
+    deleted: true,
+    deletedAt: now,
+    updatedAt: now,
+  } : {
+    id: pillId,
+    name: '',
+    dosage: '',
+    reminders: [],
+    deleted: true,
+    deletedAt: now,
+    updatedAt: now,
+  };
+
+  const { error } = await supabase.from('pills').upsert({
+    id: pillId,
+    user_id: expectedUserId,
+    pill_name: tombstone.name || '[deleted]',
+    pill_data: tombstone,
+    updated_at: new Date(now).toISOString(),
+  }, {
+    onConflict: 'id',
+  });
 
   if (error) {
     return { success: false, error: error.message };
@@ -155,7 +194,8 @@ export const flushOutbox = async (userId: string): Promise<SyncResult> => {
 
     let result: SyncResult;
     if (entry.type === 'delete') {
-      result = await deletePillFromCloudById(entry.id, userId);
+      // Pass pill for full tombstone data (preserves history, etc.)
+      result = await deletePillFromCloudById(entry.id, userId, entry.pill);
     } else if (entry.pill) {
       result = await upsertPillToCloud(entry.pill, userId);
     } else {
@@ -192,12 +232,14 @@ export const markPillDirty = (
     ...pill,
     updatedAt: now,
     deleted: type === 'delete' ? true : undefined,
+    deletedAt: type === 'delete' ? now : undefined,
   };
 
   const entry: OutboxEntry = {
     id: pill.id,
     type,
-    pill: type === 'upsert' ? updated : undefined,
+    // Include pill for both upsert and delete (delete needs it for full tombstone)
+    pill: updated,
     updatedAt: now,
     userId,
   };

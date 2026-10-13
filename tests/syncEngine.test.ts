@@ -353,24 +353,17 @@ describe('syncEngine: Cloud Operations', () => {
   });
 
   describe('flushOutbox', () => {
-    it('processes all entries in outbox', async () => {
+    it('processes all entries in outbox (soft-delete uses upsert)', async () => {
       vi.mocked(supabase.auth.getSession).mockResolvedValue({
         data: { session: { user: mockUser } as any },
         error: null,
       });
 
       const upsertFn = vi.fn().mockResolvedValue({ error: null });
-      const deleteFn = vi.fn().mockReturnThis();
-      const eqFn = vi.fn().mockReturnThis();
-      const eqFn2 = vi.fn().mockResolvedValue({ error: null });
 
       vi.mocked(supabase.from).mockImplementation(() => ({
         upsert: upsertFn,
-        delete: deleteFn,
       } as any));
-      
-      deleteFn.mockReturnValue({ eq: eqFn });
-      eqFn.mockReturnValue({ eq: eqFn2 });
 
       // Add entries to outbox
       const pill1 = createTestPill('pill-1', 'Test 1', Date.now());
@@ -385,6 +378,7 @@ describe('syncEngine: Cloud Operations', () => {
       addToOutbox(userA, {
         id: 'pill-2',
         type: 'delete',
+        pill: pill2, // Include pill for full tombstone
         updatedAt: Date.now(),
         userId: userA,
       });
@@ -392,8 +386,8 @@ describe('syncEngine: Cloud Operations', () => {
       const result = await flushOutbox(userA);
 
       expect(result.success).toBe(true);
-      expect(upsertFn).toHaveBeenCalledTimes(1);
-      expect(deleteFn).toHaveBeenCalledTimes(1);
+      // Both upsert and delete now use upsert (delete is soft-delete tombstone)
+      expect(upsertFn).toHaveBeenCalledTimes(2);
       
       // Outbox should be empty after successful flush
       const outbox = loadOutboxFromStorage(userA);
@@ -532,30 +526,94 @@ describe('syncEngine: Two-Tab Delete Coordination', () => {
     expect(visiblePills).toHaveLength(0);
   });
 
-  it('delete outbox entry leads to explicit cloud delete, not bulk rewrite', async () => {
+  it('delete outbox entry leads to soft-delete (upsert tombstone), not hard delete', async () => {
     vi.mocked(supabase.auth.getSession).mockResolvedValue({
       data: { session: { user: { id: userA } } as any },
       error: null,
     });
 
-    const deleteFn = vi.fn().mockReturnThis();
-    const eqIdFn = vi.fn().mockReturnThis();
-    const eqUserFn = vi.fn().mockResolvedValue({ error: null });
+    const upsertFn = vi.fn().mockResolvedValue({ error: null });
 
     vi.mocked(supabase.from).mockImplementation(() => ({
-      delete: deleteFn,
+      upsert: upsertFn,
     } as any));
-    
-    deleteFn.mockReturnValue({ eq: eqIdFn });
-    eqIdFn.mockReturnValue({ eq: eqUserFn });
 
-    // Verify deletePillFromCloudById uses explicit ID delete
-    const result = await deletePillFromCloudById('pill-1', userA);
+    const pillToDelete = createTestPill('pill-1', 'To Delete', Date.now());
+
+    // Verify deletePillFromCloudById uses soft-delete (upsert with tombstone)
+    const result = await deletePillFromCloudById('pill-1', userA, pillToDelete);
 
     expect(result.success).toBe(true);
-    expect(deleteFn).toHaveBeenCalled();
-    expect(eqIdFn).toHaveBeenCalledWith('id', 'pill-1');
-    expect(eqUserFn).toHaveBeenCalledWith('user_id', userA);
+    expect(upsertFn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'pill-1',
+        user_id: userA,
+        pill_data: expect.objectContaining({
+          deleted: true,
+          deletedAt: expect.any(Number),
+        }),
+      }),
+      expect.objectContaining({ onConflict: 'id' })
+    );
+  });
+});
+
+describe('syncEngine: Tombstone-Wins Rule', () => {
+  const userA = 'user-a';
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it('cloud tombstone prevents resurrection by stale local edit', () => {
+    // Browser B deleted pill W (now a tombstone in cloud)
+    const cloudTombstone = createTestPill('pill-w', 'Deleted Pill', Date.now(), true);
+    
+    // Browser A has stale data with the pill still active and marks a dose
+    const staleLocalPill = createTestPill('pill-w', 'Pill W with new dose', Date.now() + 1000);
+    const outboxEntry: OutboxEntry = {
+      id: 'pill-w',
+      type: 'upsert',
+      pill: staleLocalPill,
+      updatedAt: staleLocalPill.updatedAt!,
+      userId: userA,
+    };
+    
+    // Merge should NOT resurrect the pill - tombstone wins
+    const result = mergePills([staleLocalPill], [cloudTombstone], [outboxEntry]);
+    
+    expect(result.pills.filter(p => p.id === 'pill-w' && !p.deleted)).toHaveLength(0);
+  });
+
+  it('cloud tombstone hides pill even without local outbox entry', () => {
+    // Cloud has tombstone
+    const cloudTombstone = createTestPill('pill-x', 'Deleted', Date.now(), true);
+    
+    // Local has stale data but no pending changes
+    const staleLocal = createTestPill('pill-x', 'Stale Local');
+    
+    const result = mergePills([staleLocal], [cloudTombstone], []);
+    
+    expect(result.pills).toHaveLength(0);
+  });
+
+  it('local delete matches cloud tombstone', () => {
+    // Both local and cloud have the pill deleted
+    const localDeleted = createTestPill('pill-y', 'Deleted', Date.now(), true);
+    const cloudTombstone = createTestPill('pill-y', 'Deleted', Date.now() - 1000, true);
+    
+    const outboxEntry: OutboxEntry = {
+      id: 'pill-y',
+      type: 'delete',
+      pill: localDeleted,
+      updatedAt: localDeleted.updatedAt!,
+      userId: userA,
+    };
+    
+    const result = mergePills([localDeleted], [cloudTombstone], [outboxEntry]);
+    
+    // Pill should not appear in visible result
+    expect(result.pills.filter(p => !p.deleted)).toHaveLength(0);
   });
 });
 

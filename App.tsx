@@ -479,11 +479,10 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
         }
         missedSweepDoneRef.current = true;
         
-        // Mark pills that had taps applied as dirty so they sync to cloud
-        // This ensures queued taps reach the cloud after recovery
-        const tappedPillIds = new Set(tapsToApply.map(t => t.pillId));
+        // Mark pills changed by sweep or taps as dirty so they sync to cloud
+        // This ensures both swept missed doses AND queued taps reach the cloud
         for (const pill of orchestrationResult.pills) {
-          if (tappedPillIds.has(pill.id)) {
+          if (orchestrationResult.changedPillIds.has(pill.id)) {
             markPillDirty(userId, pill, 'upsert');
           }
         }

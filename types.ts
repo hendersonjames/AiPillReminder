@@ -26,6 +26,7 @@ export interface Pill {
   createdAt?: number; // Timestamp when the pill was created (local device time)
   updatedAt?: number; // Timestamp of last local edit (for conflict resolution)
   deleted?: boolean;  // Soft-delete tombstone for multi-tab sync
+  deletedAt?: number; // Timestamp when deleted (for tombstone-wins rule)
 }
 
 // Outbox entry for offline/pending changes

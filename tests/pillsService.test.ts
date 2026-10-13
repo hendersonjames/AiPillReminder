@@ -182,29 +182,33 @@ describe('pillsService', () => {
   });
 
   describe('deletePillFromCloudById', () => {
-    it('deletes a pill by ID with user verification', async () => {
+    it('soft-deletes a pill by upserting tombstone', async () => {
       vi.mocked(supabase.auth.getSession).mockResolvedValue({
         data: { session: { user: mockUser } as any },
         error: null,
       });
 
-      const deleteFn = vi.fn().mockReturnThis();
-      const eqIdFn = vi.fn().mockReturnThis();
-      const eqUserFn = vi.fn().mockResolvedValue({ error: null });
+      const upsertFn = vi.fn().mockResolvedValue({ error: null });
 
       vi.mocked(supabase.from).mockReturnValue({
-        delete: deleteFn,
+        upsert: upsertFn,
       } as any);
 
-      deleteFn.mockReturnValue({ eq: eqIdFn });
-      eqIdFn.mockReturnValue({ eq: eqUserFn });
-
-      const result = await deletePillFromCloudById('p1', mockUserId);
+      const pill = createTestPill('p1', 'Test Pill');
+      const result = await deletePillFromCloudById('p1', mockUserId, pill);
 
       expect(result.success).toBe(true);
-      expect(deleteFn).toHaveBeenCalled();
-      expect(eqIdFn).toHaveBeenCalledWith('id', 'p1');
-      expect(eqUserFn).toHaveBeenCalledWith('user_id', mockUserId);
+      expect(upsertFn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'p1',
+          user_id: mockUserId,
+          pill_data: expect.objectContaining({
+            deleted: true,
+            deletedAt: expect.any(Number),
+          }),
+        }),
+        expect.objectContaining({ onConflict: 'id' })
+      );
     });
 
     it('returns error on deletion failure', async () => {
@@ -213,21 +217,46 @@ describe('pillsService', () => {
         error: null,
       });
 
-      const deleteFn = vi.fn().mockReturnThis();
-      const eqIdFn = vi.fn().mockReturnThis();
-      const eqUserFn = vi.fn().mockResolvedValue({ error: { message: 'Delete failed' } });
+      const upsertFn = vi.fn().mockResolvedValue({ error: { message: 'Upsert failed' } });
 
       vi.mocked(supabase.from).mockReturnValue({
-        delete: deleteFn,
+        upsert: upsertFn,
       } as any);
-
-      deleteFn.mockReturnValue({ eq: eqIdFn });
-      eqIdFn.mockReturnValue({ eq: eqUserFn });
 
       const result = await deletePillFromCloudById('p1', mockUserId);
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('Delete failed');
+      expect(result.error).toBe('Upsert failed');
+    });
+
+    it('creates minimal tombstone when pill is not provided', async () => {
+      vi.mocked(supabase.auth.getSession).mockResolvedValue({
+        data: { session: { user: mockUser } as any },
+        error: null,
+      });
+
+      const upsertFn = vi.fn().mockResolvedValue({ error: null });
+
+      vi.mocked(supabase.from).mockReturnValue({
+        upsert: upsertFn,
+      } as any);
+
+      const result = await deletePillFromCloudById('p1', mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(upsertFn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'p1',
+          user_id: mockUserId,
+          pill_name: '[deleted]',
+          pill_data: expect.objectContaining({
+            id: 'p1',
+            deleted: true,
+            deletedAt: expect.any(Number),
+          }),
+        }),
+        expect.objectContaining({ onConflict: 'id' })
+      );
     });
   });
 
@@ -295,27 +324,24 @@ describe('pillsService', () => {
       expect(loadOutboxFromStorage(mockUserId)).toHaveLength(1);
     });
 
-    it('processes delete entries from outbox', async () => {
+    it('processes delete entries from outbox (soft-delete via upsert)', async () => {
       vi.mocked(supabase.auth.getSession).mockResolvedValue({
         data: { session: { user: mockUser } as any },
         error: null,
       });
 
-      const deleteFn = vi.fn().mockReturnThis();
-      const eqIdFn = vi.fn().mockReturnThis();
-      const eqUserFn = vi.fn().mockResolvedValue({ error: null });
+      const upsertFn = vi.fn().mockResolvedValue({ error: null });
 
       vi.mocked(supabase.from).mockReturnValue({
-        delete: deleteFn,
+        upsert: upsertFn,
       } as any);
 
-      deleteFn.mockReturnValue({ eq: eqIdFn });
-      eqIdFn.mockReturnValue({ eq: eqUserFn });
-
-      // Add delete entry to outbox
+      // Add delete entry to outbox with pill data for full tombstone
+      const pill = createTestPill('p1', 'Test Pill');
       const entry: OutboxEntry = {
         id: 'p1',
         type: 'delete',
+        pill, // Include pill for full tombstone
         updatedAt: Date.now(),
         userId: mockUserId,
       };
@@ -325,7 +351,17 @@ describe('pillsService', () => {
       const result = await flushOutbox(mockUserId);
 
       expect(result.success).toBe(true);
-      expect(deleteFn).toHaveBeenCalled();
+      // Delete now uses upsert with tombstone
+      expect(upsertFn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'p1',
+          pill_data: expect.objectContaining({
+            deleted: true,
+            deletedAt: expect.any(Number),
+          }),
+        }),
+        expect.any(Object)
+      );
       expect(loadOutboxFromStorage(mockUserId)).toHaveLength(0);
     });
 

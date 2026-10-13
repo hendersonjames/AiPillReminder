@@ -257,6 +257,79 @@ describe('loadOrchestration: Sweep After Load', () => {
       // Only 1 tap applied (user-a's tap)
       expect(result.tapsApplied).toBe(1);
     });
+
+    it('returns changedPillIds for pills modified by sweep (H3 fix)', () => {
+      const weekAgo = new Date();
+      weekAgo.setDate(weekAgo.getDate() - 7);
+      const pill = createTestPill('p1', 'Old Pill', weekAgo.getTime());
+
+      const threeDaysAgo = new Date();
+      threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
+      const lastSweep = getDateString(threeDaysAgo);
+
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = getDateString(yesterday);
+
+      const result = orchestrateAfterCloudLoad(
+        [pill],
+        lastSweep,
+        yesterdayStr,
+        [], // No taps
+        'user-a',
+        recordMissedDoses
+      );
+
+      // Sweep ran and changed the pill
+      expect(result.sweepRan).toBe(true);
+      expect(result.changedPillIds.has('p1')).toBe(true);
+    });
+
+    it('returns changedPillIds for pills modified by taps', () => {
+      const pill = createTestPill('p1', 'Pill');
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = getDateString(yesterday);
+
+      const queuedTaps: QueuedTap[] = [
+        { pillId: 'p1', reminderId: 'r1', userId: 'user-a' },
+      ];
+
+      const result = orchestrateAfterCloudLoad(
+        [pill],
+        yesterdayStr, // Already swept
+        yesterdayStr,
+        queuedTaps,
+        'user-a',
+        recordMissedDoses
+      );
+
+      expect(result.changedPillIds.has('p1')).toBe(true);
+    });
+
+    it('does not include unchanged pills in changedPillIds', () => {
+      const pill1 = createTestPill('p1', 'Pill 1');
+      const pill2 = createTestPill('p2', 'Pill 2');
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = getDateString(yesterday);
+
+      const queuedTaps: QueuedTap[] = [
+        { pillId: 'p1', reminderId: 'r1', userId: 'user-a' }, // Only tap p1
+      ];
+
+      const result = orchestrateAfterCloudLoad(
+        [pill1, pill2],
+        yesterdayStr, // Already swept
+        yesterdayStr,
+        queuedTaps,
+        'user-a',
+        recordMissedDoses
+      );
+
+      expect(result.changedPillIds.has('p1')).toBe(true);
+      expect(result.changedPillIds.has('p2')).toBe(false);
+    });
   });
 });
 
