@@ -313,6 +313,50 @@ describe('pillHelpers', () => {
       // No missed - can only start missing the day AFTER creation, which is today (not sweepable)
       expect(result.hasChanges).toBe(false);
     });
+
+    it('records correct missed doses after 3-day clock jump', () => {
+      // Scenario: User opened app 4 days ago, then didn't open for 3 days
+      // Today they open again - should have missed doses for days 2, 3, and yesterday (3 total)
+      const fourDaysAgo = new Date();
+      fourDaysAgo.setDate(fourDaysAgo.getDate() - 4);
+      fourDaysAgo.setHours(12, 0, 0, 0);
+      
+      const pill = createPill('p1', 'Daily Pill', [
+        { id: 'r1', time: '09:00', daysOfWeek: [0, 1, 2, 3, 4, 5, 6], taken: false },
+      ]);
+      // Pill was created before the 4-day window
+      (pill as any).createdAt = fourDaysAgo.getTime() - 86400000 * 10; // 14 days ago
+
+      // Last sweep was 4 days ago (user last opened app)
+      const lastSweepStr = getDateString(fourDaysAgo);
+
+      const result = recordMissedDoses([pill], lastSweepStr);
+
+      // Should have missed entries for: 3 days ago, 2 days ago, yesterday = 3 entries
+      expect(result.hasChanges).toBe(true);
+      const missedEntries = result.updatedPills[0].history?.filter(h => h.action === 'missed') || [];
+      expect(missedEntries.length).toBe(3);
+      
+      // Verify the dates are correct
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const twoDaysAgo = new Date();
+      twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
+      const threeDaysAgo = new Date();
+      threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
+      
+      const expectedDates = [
+        getDateString(threeDaysAgo),
+        getDateString(twoDaysAgo),
+        getDateString(yesterday),
+      ];
+      
+      missedEntries.forEach(entry => {
+        // Entry ID contains the date
+        const hasExpectedDate = expectedDates.some(d => entry.id.includes(d));
+        expect(hasExpectedDate).toBe(true);
+      });
+    });
   });
 
   describe('removeLatestTakenEntry', () => {

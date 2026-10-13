@@ -208,6 +208,9 @@ const CalendarGrid: React.FC<{ pill: Pill; datesInRange: Date[] }> = ({ pill, da
 const DoctorReport: React.FC<DoctorReportProps> = ({ pills, onClose }) => {
   const [period, setPeriod] = useState<Period>('30');
 
+  // Filter out tombstoned/deleted pills - they shouldn't appear in reports
+  const activePills = useMemo(() => pills.filter(p => !p.deleted), [pills]);
+
   const daysCount = parseInt(period, 10);
   const datesInRange = useMemo(() => getDaysInRange(daysCount), [daysCount]);
 
@@ -281,7 +284,7 @@ const DoctorReport: React.FC<DoctorReportProps> = ({ pills, onClose }) => {
         </div>
 
         {/* ── Empty state ── */}
-        {pills.length === 0 && (
+        {activePills.length === 0 && (
           <div className="text-center py-12 text-slate-400">
             <p className="text-lg">No medications added yet.</p>
             <p className="text-sm mt-1">Add pills in the main app to generate a report.</p>
@@ -289,7 +292,7 @@ const DoctorReport: React.FC<DoctorReportProps> = ({ pills, onClose }) => {
         )}
 
         {/* ── Per-medication sections ── */}
-        {pills.map((pill, idx) => {
+        {activePills.map((pill, idx) => {
           const adherence = calcAdherence(pill, datesInRange);
           const recentHistory = (pill.history || [])
             .filter(h => {
