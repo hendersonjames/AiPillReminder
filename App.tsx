@@ -10,7 +10,7 @@ import DoctorReport from './components/DoctorReport';
 import { ChatIcon, PlusIcon } from './components/icons/Icons';
 import { playSound } from './services/soundService';
 import { onAuthStateChange, signOut, cleanupUserData, type User } from './services/authService';
-import { loadPillsFromCloud, syncPillsToCloud, syncPillChange, syncPillDelete } from './services/pillsService';
+import { loadPillsFromCloud } from './services/pillsService';
 import {
   requestNotificationPermission,
   fireImmediateNotification,
@@ -47,6 +47,7 @@ import {
   initBroadcastChannel,
   broadcastPillChange,
   broadcastPillsLoaded,
+  hasUnsyncedChanges,
   type SyncMessage,
 } from './lib/syncEngine';
 import {
@@ -167,6 +168,26 @@ const App: React.FC = () => {
 
   const handleSignOut = useCallback(async () => {
     const currentUserId = prevUserIdRef.current;
+    
+    // Check for unsynced changes before sign-out
+    if (currentUserId && hasUnsyncedChanges(currentUserId)) {
+      // Try to flush first
+      const flushCallback = flushCallbackRef.current;
+      if (flushCallback) {
+        const flushed = await flushCallback();
+        if (!flushed) {
+          // Warn user about potential data loss
+          const confirmed = window.confirm(
+            'You have unsynced changes that could not be saved. ' +
+            'If you sign out now, these changes may be lost. Continue?'
+          );
+          if (!confirmed) {
+            return;
+          }
+        }
+      }
+    }
+    
     signingOutRef.current = true;
     setSignOutError(null);
     
@@ -356,11 +377,12 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   }, [userId]);
 
   // ─── Flush pending sync (for visibilitychange/pagehide AND sign-out) ────────
-  const flushPendingSync = useCallback(async () => {
+  // Only flushes the outbox - no full-list sync
+  const flushPendingSync = useCallback(async (): Promise<boolean> => {
     // Allow flush during sign-out (we WANT to save before clearing)
     // But don't flush if not for this user
-    if (!cloudLoadSucceededRef.current) return;
-    if (loadedForUserIdRef.current !== userId) return;
+    if (!cloudLoadSucceededRef.current) return false;
+    if (loadedForUserIdRef.current !== userId) return false;
     
     // Cancel any pending debounced sync
     if (syncTimeoutRef.current) {
@@ -368,18 +390,17 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       syncTimeoutRef.current = undefined;
     }
     
-    // Check if there's actually pending changes
-    if (!hasPendingSync(userId)) return;
-    
+    // Flush the outbox (per-pill upserts/deletes only)
     try {
-      const result = await syncPillsToCloud(userId, pillsRef.current, cloudIdsRef.current);
+      const result = await flushOutbox(userId);
       if (result.success) {
-        saveCloudIdsToStorage(userId, new Set(pillsRef.current.map(p => p.id)));
-        cloudIdsRef.current = new Set(pillsRef.current.map(p => p.id));
         setPendingSync(userId, false);
+        return true;
       }
+      return false;
     } catch (err) {
       console.error('Flush sync failed:', err);
+      return false;
     }
   }, [userId]);
 
@@ -441,23 +462,35 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
         yesterday.setDate(yesterday.getDate() - 1);
         const yesterdayStr = getDateString(yesterday);
         
+        // Get taps to apply before clearing
+        const tapsToApply = [...pendingNotifTapsRef.current];
+        
         const orchestrationResult = orchestrateAfterCloudLoad(
           mergedPills,
           lastSweep,
           yesterdayStr,
-          pendingNotifTapsRef.current,
+          tapsToApply,
           userId,
           recordMissedDoses
         );
-        
-        // Clear queued taps from memory and storage after applying
-        pendingNotifTapsRef.current = [];
-        clearQueuedTaps(userId);
         
         if (orchestrationResult.sweepRan) {
           setLastMissedSweepDate(userId, yesterdayStr);
         }
         missedSweepDoneRef.current = true;
+        
+        // Mark pills that had taps applied as dirty so they sync to cloud
+        // This ensures queued taps reach the cloud after recovery
+        const tappedPillIds = new Set(tapsToApply.map(t => t.pillId));
+        for (const pill of orchestrationResult.pills) {
+          if (tappedPillIds.has(pill.id)) {
+            markPillDirty(userId, pill, 'upsert');
+          }
+        }
+        
+        // NOW clear queued taps from memory and storage
+        pendingNotifTapsRef.current = [];
+        clearQueuedTaps(userId);
         
         // Use orchestrated pills, enhanced with derived taken status
         const enhancedPills = enhancePillsWithDerivedStatus(orchestrationResult.pills);
@@ -471,8 +504,9 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
           await scheduleAllPillNotifications(orchestrationResult.pills);
         }
         
-        // If we have local changes (outbox not empty), flush them now
-        if (hasLocalChanges) {
+        // Flush outbox (includes local changes + tapped pills)
+        const currentOutbox = loadOutboxFromStorage(userId);
+        if (currentOutbox.length > 0 || hasLocalChanges) {
           const flushResult = await flushOutbox(userId);
           if (flushResult.success) {
             setSyncStatus('synced');
@@ -523,12 +557,17 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
     savePillsToStorage(userId, pills);
   }, [pills, userId]);
 
-  // ─── Debounced cloud sync (only after successful load) ──────────────────────
+  // ─── Debounced outbox flush (only after successful load) ─────────────────────
+  // Only syncs items in the outbox - no full-list re-upload
   useEffect(() => {
     // Block sync during sign-out or before load succeeds
     if (signingOutRef.current) return;
     if (!cloudLoadSucceededRef.current) return;
     if (loadedForUserIdRef.current !== userId) return;
+    
+    // Check if outbox has items to sync
+    const outbox = loadOutboxFromStorage(userId);
+    if (outbox.length === 0) return;
     
     // Mark that there's a pending sync
     setPendingSync(userId, true);
@@ -543,17 +582,18 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       
       try {
         setSyncStatus('syncing');
-        const result = await syncPillsToCloud(userId, pills, cloudIdsRef.current);
+        const result = await flushOutbox(userId);
         
         if (result.aborted) {
-          // User changed during sync - don't update state
           console.warn('Sync aborted:', result.error);
           setSyncStatus('error');
           return;
         }
         
         if (result.success) {
-          const newCloudIds = new Set<string>(pills.map(p => p.id));
+          // Update cloud IDs based on current pills (non-deleted)
+          const currentPills = pillsRef.current.filter(p => !p.deleted);
+          const newCloudIds = new Set<string>(currentPills.map(p => p.id));
           cloudIdsRef.current = newCloudIds;
           saveCloudIdsToStorage(userId, newCloudIds);
           setPendingSync(userId, false);

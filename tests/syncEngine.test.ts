@@ -23,6 +23,7 @@ import {
   flushOutbox,
   upsertPillToCloud,
   deletePillFromCloudById,
+  hasUnsyncedChanges,
 } from '../lib/syncEngine';
 import {
   loadOutboxFromStorage,
@@ -555,5 +556,117 @@ describe('syncEngine: Two-Tab Delete Coordination', () => {
     expect(deleteFn).toHaveBeenCalled();
     expect(eqIdFn).toHaveBeenCalledWith('id', 'pill-1');
     expect(eqUserFn).toHaveBeenCalledWith('user_id', userA);
+  });
+});
+
+describe('syncEngine: Merge Edge Cases', () => {
+  const userA = 'user-a';
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it('merge does NOT keep tombstoned/deleted pills in final result', () => {
+    const deletedPill = createTestPill('pill-1', 'Deleted', Date.now(), true);
+    const normalPill = createTestPill('pill-2', 'Normal', Date.now());
+    
+    // Both pills are in outbox - deleted one for delete, normal one for upsert
+    const outbox: OutboxEntry[] = [
+      { id: 'pill-1', type: 'delete', updatedAt: Date.now(), userId: userA },
+      { id: 'pill-2', type: 'upsert', pill: normalPill, updatedAt: Date.now(), userId: userA },
+    ];
+    
+    const result = mergePills([deletedPill, normalPill], [], outbox);
+    
+    // Only the normal pill should be in the final result (deleted is filtered out)
+    expect(result.pills).toHaveLength(1);
+    expect(result.pills[0].id).toBe('pill-2');
+    expect(result.pills.some(p => p.deleted)).toBe(false);
+  });
+
+  it('merge keeps local-only unsynced pills (not yet in cloud)', () => {
+    const localOnlyPill = createTestPill('local-only', 'New Local Pill', Date.now());
+    
+    const outbox: OutboxEntry[] = [
+      { id: 'local-only', type: 'upsert', pill: localOnlyPill, updatedAt: Date.now(), userId: userA },
+    ];
+    
+    // Cloud has no pills
+    const result = mergePills([localOnlyPill], [], outbox);
+    
+    expect(result.pills).toHaveLength(1);
+    expect(result.pills[0].id).toBe('local-only');
+    expect(result.hasLocalChanges).toBe(true);
+  });
+
+  it('merge does NOT drop local-only pills when in outbox and cloud is empty', () => {
+    const localPill1 = createTestPill('local-1', 'Local 1', Date.now());
+    const localPill2 = createTestPill('local-2', 'Local 2', Date.now());
+    
+    const outbox: OutboxEntry[] = [
+      { id: 'local-1', type: 'upsert', pill: localPill1, updatedAt: Date.now(), userId: userA },
+      { id: 'local-2', type: 'upsert', pill: localPill2, updatedAt: Date.now(), userId: userA },
+    ];
+    
+    const result = mergePills([localPill1, localPill2], [], outbox);
+    
+    expect(result.pills).toHaveLength(2);
+    expect(result.pills.map(p => p.id).sort()).toEqual(['local-1', 'local-2']);
+  });
+
+  it('merge drops local pills not in outbox when cloud is empty (deleted elsewhere)', () => {
+    // This simulates a pill that was synced, then deleted from cloud elsewhere
+    const localPill = createTestPill('stale-local', 'Stale', Date.now() - 10000);
+    
+    // No outbox entry for this pill - it's stale local data
+    const result = mergePills([localPill], [], []);
+    
+    // Since it's not in outbox and not in cloud, it was deleted elsewhere - drop it
+    expect(result.pills).toHaveLength(0);
+  });
+});
+
+describe('syncEngine: hasUnsyncedChanges', () => {
+  const userA = 'user-a';
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  it('returns true when outbox has entries', () => {
+    const pill = createTestPill('pill-1', 'Test');
+    markPillDirty(userA, pill, 'upsert');
+    
+    expect(hasUnsyncedChanges(userA)).toBe(true);
+  });
+
+  it('returns false when outbox is empty', () => {
+    expect(hasUnsyncedChanges(userA)).toBe(false);
+  });
+});
+
+describe('syncEngine: Outbox Deduplication', () => {
+  const userA = 'user-a';
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it('multiple edits to same pill result in single outbox entry', () => {
+    const pill = createTestPill('pill-1', 'Original');
+    
+    // Edit 1
+    markPillDirty(userA, { ...pill, name: 'Edit 1' }, 'upsert');
+    // Edit 2
+    markPillDirty(userA, { ...pill, name: 'Edit 2' }, 'upsert');
+    // Edit 3
+    markPillDirty(userA, { ...pill, name: 'Edit 3' }, 'upsert');
+    
+    const outbox = loadOutboxFromStorage(userA);
+    
+    // Should only have one entry for this pill (latest)
+    expect(outbox).toHaveLength(1);
+    expect(outbox[0].pill?.name).toBe('Edit 3');
   });
 });

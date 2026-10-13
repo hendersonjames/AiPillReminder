@@ -206,6 +206,11 @@ export const markPillDirty = (
   return updated;
 };
 
+export const hasUnsyncedChanges = (userId: string): boolean => {
+  const outbox = loadOutboxFromStorage(userId);
+  return outbox.length > 0;
+};
+
 // ─── Multi-Tab Coordination ───────────────────────────────────────────────────
 
 const SYNC_CHANNEL_NAME = 'remedi_sync_channel';
