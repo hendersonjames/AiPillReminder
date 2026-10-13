@@ -24,6 +24,17 @@ export interface Pill {
   reminders: Reminder[];
   history?: HistoryEntry[];
   createdAt?: number; // Timestamp when the pill was created (local device time)
+  updatedAt?: number; // Timestamp of last local edit (for conflict resolution)
+  deleted?: boolean;  // Soft-delete tombstone for multi-tab sync
+}
+
+// Outbox entry for offline/pending changes
+export interface OutboxEntry {
+  id: string;          // Same as pill ID
+  type: 'upsert' | 'delete';
+  pill?: Pill;         // Full pill for upsert, undefined for delete
+  updatedAt: number;   // When this change was queued
+  userId: string;      // Owner of this change
 }
 
 export enum MessageAuthor {

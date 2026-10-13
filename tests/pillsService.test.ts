@@ -85,15 +85,16 @@ describe('pillsService', () => {
 
       const upsertFn = vi.fn().mockResolvedValue({ error: null });
       const deleteFn = vi.fn().mockReturnThis();
-      const eqFn = vi.fn().mockResolvedValue({ error: null });
+      const eqIdFn = vi.fn().mockReturnThis();
+      const eqUserFn = vi.fn().mockResolvedValue({ error: null });
 
       vi.mocked(supabase.from).mockImplementation((table: string) => ({
         upsert: upsertFn,
         delete: deleteFn,
-        eq: eqFn,
       } as any));
 
-      deleteFn.mockReturnValue({ eq: eqFn });
+      deleteFn.mockReturnValue({ eq: eqIdFn });
+      eqIdFn.mockReturnValue({ eq: eqUserFn });
 
       const result = await syncPillsToCloud(mockUserId, localPills, existingCloudIds);
 
@@ -216,19 +217,22 @@ describe('pillsService', () => {
       });
 
       const deleteFn = vi.fn().mockReturnThis();
-      const eqFn = vi.fn().mockResolvedValue({ error: null });
+      const eqIdFn = vi.fn().mockReturnThis();
+      const eqUserFn = vi.fn().mockResolvedValue({ error: null });
 
       vi.mocked(supabase.from).mockReturnValue({
         delete: deleteFn,
       } as any);
 
-      deleteFn.mockReturnValue({ eq: eqFn });
+      deleteFn.mockReturnValue({ eq: eqIdFn });
+      eqIdFn.mockReturnValue({ eq: eqUserFn });
 
       const result = await deletePillFromCloud('p1', mockUserId);
 
       expect(result.success).toBe(true);
       expect(deleteFn).toHaveBeenCalled();
-      expect(eqFn).toHaveBeenCalledWith('id', 'p1');
+      expect(eqIdFn).toHaveBeenCalledWith('id', 'p1');
+      expect(eqUserFn).toHaveBeenCalledWith('user_id', mockUserId);
     });
 
     it('returns error on deletion failure', async () => {
@@ -238,13 +242,15 @@ describe('pillsService', () => {
       });
 
       const deleteFn = vi.fn().mockReturnThis();
-      const eqFn = vi.fn().mockResolvedValue({ error: { message: 'Delete failed' } });
+      const eqIdFn = vi.fn().mockReturnThis();
+      const eqUserFn = vi.fn().mockResolvedValue({ error: { message: 'Delete failed' } });
 
       vi.mocked(supabase.from).mockReturnValue({
         delete: deleteFn,
       } as any);
 
-      deleteFn.mockReturnValue({ eq: eqFn });
+      deleteFn.mockReturnValue({ eq: eqIdFn });
+      eqIdFn.mockReturnValue({ eq: eqUserFn });
 
       const result = await deletePillFromCloud('p1', mockUserId);
 

@@ -1,12 +1,15 @@
 // lib/storage.ts
 // User-scoped localStorage utilities to prevent data leakage between users
 
-import type { Pill } from '../types';
+import type { Pill, OutboxEntry } from '../types';
+import type { QueuedTap } from './loadOrchestration';
 
 const PILLS_KEY_PREFIX = 'remedi_pills_';
 const LAST_SWEEP_KEY_PREFIX = 'remedi_last_missed_sweep_';
 const PENDING_SYNC_KEY_PREFIX = 'remedi_pending_sync_';
 const CLOUD_IDS_KEY_PREFIX = 'remedi_cloud_ids_';
+const OUTBOX_KEY_PREFIX = 'remedi_outbox_';
+const QUEUED_TAPS_KEY_PREFIX = 'remedi_queued_taps_';
 
 // Legacy unscoped keys that must be purged (from pre-fix versions)
 const LEGACY_UNSCOPED_KEYS = ['pills', 'remedi_last_missed_sweep'];
@@ -76,6 +79,93 @@ export const saveCloudIdsToStorage = (userId: string, ids: Set<string>): void =>
   }
 };
 
+// ─── Outbox (durable offline queue) ───────────────────────────────────────────
+
+export const loadOutboxFromStorage = (userId: string): OutboxEntry[] => {
+  try {
+    const key = getUserKey(OUTBOX_KEY_PREFIX, userId);
+    const stored = localStorage.getItem(key);
+    if (stored) {
+      return JSON.parse(stored);
+    }
+  } catch (error) {
+    console.error('Failed to parse outbox from localStorage', error);
+  }
+  return [];
+};
+
+export const saveOutboxToStorage = (userId: string, outbox: OutboxEntry[]): void => {
+  try {
+    const key = getUserKey(OUTBOX_KEY_PREFIX, userId);
+    if (outbox.length === 0) {
+      localStorage.removeItem(key);
+    } else {
+      localStorage.setItem(key, JSON.stringify(outbox));
+    }
+  } catch (error) {
+    console.error('Failed to save outbox to localStorage', error);
+  }
+};
+
+export const addToOutbox = (userId: string, entry: OutboxEntry): void => {
+  const outbox = loadOutboxFromStorage(userId);
+  const existingIndex = outbox.findIndex(e => e.id === entry.id);
+  if (existingIndex >= 0) {
+    outbox[existingIndex] = entry;
+  } else {
+    outbox.push(entry);
+  }
+  saveOutboxToStorage(userId, outbox);
+};
+
+export const removeFromOutbox = (userId: string, id: string): void => {
+  const outbox = loadOutboxFromStorage(userId);
+  const filtered = outbox.filter(e => e.id !== id);
+  saveOutboxToStorage(userId, filtered);
+};
+
+export const clearOutbox = (userId: string): void => {
+  saveOutboxToStorage(userId, []);
+};
+
+// ─── Queued notification taps (persist failed-load taps) ──────────────────────
+
+export const loadQueuedTapsFromStorage = (userId: string): QueuedTap[] => {
+  try {
+    const key = getUserKey(QUEUED_TAPS_KEY_PREFIX, userId);
+    const stored = localStorage.getItem(key);
+    if (stored) {
+      return JSON.parse(stored);
+    }
+  } catch (error) {
+    console.error('Failed to parse queued taps from localStorage', error);
+  }
+  return [];
+};
+
+export const saveQueuedTapsToStorage = (userId: string, taps: QueuedTap[]): void => {
+  try {
+    const key = getUserKey(QUEUED_TAPS_KEY_PREFIX, userId);
+    if (taps.length === 0) {
+      localStorage.removeItem(key);
+    } else {
+      localStorage.setItem(key, JSON.stringify(taps));
+    }
+  } catch (error) {
+    console.error('Failed to save queued taps to localStorage', error);
+  }
+};
+
+export const addQueuedTap = (userId: string, tap: QueuedTap): void => {
+  const taps = loadQueuedTapsFromStorage(userId);
+  taps.push(tap);
+  saveQueuedTapsToStorage(userId, taps);
+};
+
+export const clearQueuedTaps = (userId: string): void => {
+  saveQueuedTapsToStorage(userId, []);
+};
+
 // ─── Missed dose sweep tracking ───────────────────────────────────────────────
 
 export const getLastMissedSweepDate = (userId: string): string | null => {
@@ -133,6 +223,8 @@ export const clearUserData = (userId: string): void => {
     getUserKey(LAST_SWEEP_KEY_PREFIX, userId),
     getUserKey(PENDING_SYNC_KEY_PREFIX, userId),
     getUserKey(CLOUD_IDS_KEY_PREFIX, userId),
+    getUserKey(OUTBOX_KEY_PREFIX, userId),
+    getUserKey(QUEUED_TAPS_KEY_PREFIX, userId),
   ];
   
   keysToRemove.forEach(key => {
