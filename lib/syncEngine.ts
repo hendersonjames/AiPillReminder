@@ -335,7 +335,7 @@ export const hasUnsyncedChanges = (userId: string): boolean => {
 // ─── Multi-Tab Coordination ───────────────────────────────────────────────────
 
 // Per-user channel name to prevent cross-user message leakage
-const getSyncChannelName = (userId: string): string => `remedi_sync_${userId}`;
+export const getSyncChannelName = (userId: string): string => `remedi_sync_${userId}`;
 
 // Message shape: only pillId, no pill data (privacy + bandwidth)
 export interface SyncMessage {
@@ -346,7 +346,7 @@ export interface SyncMessage {
 }
 
 // Validate incoming message shape
-const isValidSyncMessage = (data: unknown): data is SyncMessage => {
+export const isValidSyncMessage = (data: unknown): data is SyncMessage => {
   if (!data || typeof data !== 'object') return false;
   const msg = data as Record<string, unknown>;
   
@@ -359,75 +359,14 @@ const isValidSyncMessage = (data: unknown): data is SyncMessage => {
   return true;
 };
 
-let broadcastChannel: BroadcastChannel | null = null;
-let currentChannelUserId: string | null = null;
-
-export const initBroadcastChannel = (
+// Create a SyncMessage object
+export const createSyncMessage = (
+  type: 'pill_changed' | 'pill_deleted' | 'pills_loaded',
   userId: string,
-  onMessage: (msg: SyncMessage) => void
-): (() => void) => {
-  if (typeof BroadcastChannel === 'undefined') {
-    return () => {};
-  }
-
-  // Close existing channel if user changed
-  if (broadcastChannel && currentChannelUserId !== userId) {
-    broadcastChannel.close();
-    broadcastChannel = null;
-  }
-
-  currentChannelUserId = userId;
-  broadcastChannel = new BroadcastChannel(getSyncChannelName(userId));
-  broadcastChannel.onmessage = (event) => {
-    // Validate message shape before processing
-    if (isValidSyncMessage(event.data)) {
-      onMessage(event.data);
-    }
-  };
-
-  return () => {
-    if (broadcastChannel) {
-      broadcastChannel.close();
-      broadcastChannel = null;
-      currentChannelUserId = null;
-    }
-  };
-};
-
-export const broadcastPillChange = (
-  type: 'pill_changed' | 'pill_deleted',
-  userId: string,
-  pillId: string
-): void => {
-  if (!broadcastChannel || currentChannelUserId !== userId) return;
-  
-  // Only send pillId, not pill data (privacy + bandwidth)
-  const msg: SyncMessage = {
-    type,
-    pillId,
-    userId,
-    timestamp: Date.now(),
-  };
-  
-  try {
-    broadcastChannel.postMessage(msg);
-  } catch {
-    // Ignore errors (e.g., channel closed)
-  }
-};
-
-export const broadcastPillsLoaded = (userId: string): void => {
-  if (!broadcastChannel || currentChannelUserId !== userId) return;
-  
-  const msg: SyncMessage = {
-    type: 'pills_loaded',
-    userId,
-    timestamp: Date.now(),
-  };
-  
-  try {
-    broadcastChannel.postMessage(msg);
-  } catch {
-    // Ignore
-  }
-};
+  pillId?: string
+): SyncMessage => ({
+  type,
+  pillId,
+  userId,
+  timestamp: Date.now(),
+});

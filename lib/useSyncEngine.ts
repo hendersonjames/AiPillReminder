@@ -2,7 +2,7 @@
 // Custom hook that encapsulates sync wiring for testability.
 // App.tsx uses this hook, and tests can verify the wiring works correctly.
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { Pill } from '../types';
 import type { QueuedTap } from './loadOrchestration';
 import {
@@ -34,7 +34,7 @@ import { recordMissedDoses, enhancePillsWithDerivedStatus } from './pillHelpers'
 export interface SyncEngineConfig {
   userId: string;
   loadPillsFromCloud: () => Promise<Pill[]>;
-  signingOut?: boolean;
+  signingOutRef?: React.RefObject<boolean>; // Pass ref for live reads (N8)
   onPillsChange?: (pills: Pill[]) => void;
   onSyncStatusChange?: (status: 'idle' | 'syncing' | 'synced' | 'error') => void;
 }
@@ -61,7 +61,7 @@ export interface UseSyncEngineResult {
 }
 
 export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => {
-  const { userId, loadPillsFromCloud, signingOut = false } = config;
+  const { userId, loadPillsFromCloud, signingOutRef } = config;
   
   const [pills, setPillsInternal] = useState<Pill[]>([]);
   const [syncStatus, setSyncStatusInternal] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
@@ -72,11 +72,12 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
   const justFlushedRef = useRef(false);
   const pillsRef = useRef<Pill[]>([]);
   const loadPillsFromCloudRef = useRef(loadPillsFromCloud);
-  const signingOutRef = useRef(signingOut);
   
-  // Keep refs in sync
+  // Helper to read signingOut live (N8 fix - read at call time, not render time)
+  const isSigningOut = (): boolean => signingOutRef?.current ?? false;
+  
+  // Keep loadPillsFromCloud ref in sync
   useEffect(() => { loadPillsFromCloudRef.current = loadPillsFromCloud; }, [loadPillsFromCloud]);
-  useEffect(() => { signingOutRef.current = signingOut; }, [signingOut]);
   
   // Store callbacks in refs to avoid effect re-runs
   const onPillsChangeRef = useRef(config.onPillsChange);
@@ -268,7 +269,7 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
   // ─── Persist to localStorage ──────────────────────────────────────────────────
   useEffect(() => {
     if (loadedForUserIdRef.current !== userId) return;
-    if (signingOutRef.current) return; // Block writes during sign-out
+    if (isSigningOut()) return; // Block writes during sign-out (N8: read live)
     savePillsToStorage(userId, pills);
   }, [pills, userId]);
   
@@ -276,7 +277,7 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
   useEffect(() => {
     if (!cloudLoadSucceededRef.current) return;
     if (loadedForUserIdRef.current !== userId) return;
-    if (signingOutRef.current) return;
+    if (isSigningOut()) return; // N8: read live
     
     if (justFlushedRef.current) {
       justFlushedRef.current = false;
@@ -291,7 +292,7 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
     
     const timeoutId = setTimeout(async () => {
       if (loadedForUserIdRef.current !== userId) return;
-      if (signingOutRef.current) return;
+      if (isSigningOut()) return; // N8: read live
       
       setSyncStatusInternal('syncing');
       const result = await flushOutbox(userId);

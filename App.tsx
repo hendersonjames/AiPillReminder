@@ -29,9 +29,10 @@ import {
   purgeLegacyUnscopedData,
 } from './lib/storage';
 import {
-  broadcastPillChange,
-  broadcastPillsLoaded,
   hasUnsyncedChanges,
+  getSyncChannelName,
+  isValidSyncMessage,
+  createSyncMessage,
 } from './lib/syncEngine';
 import { useSyncEngine } from './lib/useSyncEngine';
 import {
@@ -251,11 +252,14 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   // Track if last reload was triggered by BroadcastChannel (prevents ping-pong)
   const reloadTriggeredByChannelRef = useRef(false);
   
+  // Single BroadcastChannel instance owned by this component for both send & receive
+  const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
+  
   // ─── Use sync engine hook for core sync wiring ──────────────────────────────
   const { state, actions } = useSyncEngine({
     userId,
     loadPillsFromCloud,
-    signingOut: signingOutRef.current,
+    signingOutRef, // Pass ref directly for live reads (N8 fix)
     onPillsChange: (newPills) => {
       // Reschedule notifications when pills change
       if (isNative()) {
@@ -264,8 +268,8 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
         });
       }
       // Broadcast to other tabs ONLY if not triggered by channel message
-      if (!reloadTriggeredByChannelRef.current) {
-        broadcastPillsLoaded(userId);
+      if (!reloadTriggeredByChannelRef.current && broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage(createSyncMessage('pills_loaded', userId));
       }
       reloadTriggeredByChannelRef.current = false;
     },
@@ -315,31 +319,35 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   useEffect(() => {
     if (typeof BroadcastChannel === 'undefined') return;
     
-    const channel = new BroadcastChannel(`remedi_sync_${userId}`);
+    const channel = new BroadcastChannel(getSyncChannelName(userId));
+    broadcastChannelRef.current = channel;
     
     channel.onmessage = (event) => {
+      // Validate message shape
+      if (!isValidSyncMessage(event.data)) return;
       const msg = event.data;
-      if (!msg || typeof msg !== 'object') return;
       if (msg.userId !== userId) return;
       
-      // Mark that reload is triggered by channel to prevent ping-pong
-      reloadTriggeredByChannelRef.current = true;
-      
       if (msg.type === 'pill_changed' && msg.pillId) {
+        // Set ping-pong flag BEFORE setPills to prevent re-broadcast
+        reloadTriggeredByChannelRef.current = true;
         const refreshedPills = loadPillsFromStorage(userId);
         setPills(enhancePillsWithDerivedStatus(refreshedPills));
       } else if (msg.type === 'pill_deleted' && msg.pillId) {
+        reloadTriggeredByChannelRef.current = true;
         setPills(prevPills => prevPills.filter(p => p.id !== msg.pillId));
       } else if (msg.type === 'pills_loaded') {
+        reloadTriggeredByChannelRef.current = true;
         const refreshedPills = loadPillsFromStorage(userId);
         setPills(enhancePillsWithDerivedStatus(refreshedPills));
       }
     };
     
     return () => {
+      broadcastChannelRef.current = null;
       channel.close();
     };
-  }, [userId]); // Only depends on userId
+  }, [userId, setPills]);
 
   // ─── Flush pending sync wrapper for sign-out ────────────────────────────────
   const flushPendingSync = useCallback(async (): Promise<boolean> => {
@@ -507,7 +515,9 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       setPills(prevPills => prevPills.map(p => (p.id === savedPill.id ? savedPill : p)));
       
       // Broadcast change to other tabs (pillId only, no data)
-      broadcastPillChange('pill_changed', userId, savedPill.id);
+      if (broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, savedPill.id));
+      }
       
       // Cancel old notifications and reschedule
       if (isNative()) {
@@ -553,7 +563,9 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       setPills(prevPills => [...prevPills, savedPill]);
       
       // Broadcast change to other tabs (pillId only, no data)
-      broadcastPillChange('pill_changed', userId, savedPill.id);
+      if (broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, savedPill.id));
+      }
       
       // Schedule notifications for new pill
       if (isNative()) {
@@ -575,90 +587,101 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   const closeModal = () => { setAddPillModalOpen(false); setPillToEdit(undefined); };
 
   // Toggle taken (for UI - allows un-marking)
+  // N4 fix: markDirty and broadcast moved OUTSIDE the setPills updater
   const toggleReminderTaken = useCallback((pillId: string, reminderId: string) => {
-    setPills(prevPills => prevPills.map(pill => {
-      if (pill.id === pillId) {
-        const history = pill.history || [];
-        const currentlyTaken = isReminderTakenToday(history, reminderId);
-        const reminder = pill.reminders.find(r => r.id === reminderId);
-        
-        if (!reminder) return pill;
-        
-        let updatedPill: Pill;
-        if (currentlyTaken) {
-          const updatedHistory = removeLatestTakenEntry(history, reminderId);
-          updatedPill = {
-            ...pill,
-            reminders: pill.reminders.map(r =>
-              r.id === reminderId ? { ...r, taken: false } : r
-            ),
-            history: updatedHistory,
-          };
-        } else {
-          const newHistoryEntry: HistoryEntry = {
-            id: `${Date.now()}-${reminderId}`,
-            reminderId: reminderId,
-            pillName: pill.name,
-            time: reminder.time,
-            action: 'taken',
-            timestamp: Date.now(),
-          };
-          
-          const updatedReminders = pill.reminders.map(r =>
-            r.id === reminderId ? { ...r, snoozedUntil: undefined, taken: true } : r
-          );
-          
-          updatedPill = {
-            ...pill,
-            reminders: updatedReminders,
-            history: [...history, newHistoryEntry],
-          };
-        }
-        
-        // Mark as dirty for sync
-        const dirtyPill = markDirty(updatedPill, 'upsert');
-        broadcastPillChange('pill_changed', userId, dirtyPill.id);
-        return dirtyPill;
-      }
-      return pill;
-    }));
-  }, [userId, markDirty]);
+    // First, compute the update using current state from ref
+    const currentPill = pillsRef.current.find(p => p.id === pillId);
+    if (!currentPill) return;
+    
+    const history = currentPill.history || [];
+    const currentlyTaken = isReminderTakenToday(history, reminderId);
+    const reminder = currentPill.reminders.find(r => r.id === reminderId);
+    if (!reminder) return;
+    
+    let updatedPill: Pill;
+    if (currentlyTaken) {
+      const updatedHistory = removeLatestTakenEntry(history, reminderId);
+      updatedPill = {
+        ...currentPill,
+        reminders: currentPill.reminders.map(r =>
+          r.id === reminderId ? { ...r, taken: false } : r
+        ),
+        history: updatedHistory,
+      };
+    } else {
+      const newHistoryEntry: HistoryEntry = {
+        id: `${Date.now()}-${reminderId}`,
+        reminderId: reminderId,
+        pillName: currentPill.name,
+        time: reminder.time,
+        action: 'taken',
+        timestamp: Date.now(),
+      };
+      
+      const updatedReminders = currentPill.reminders.map(r =>
+        r.id === reminderId ? { ...r, snoozedUntil: undefined, taken: true } : r
+      );
+      
+      updatedPill = {
+        ...currentPill,
+        reminders: updatedReminders,
+        history: [...history, newHistoryEntry],
+      };
+    }
+    
+    // Mark as dirty OUTSIDE the updater
+    const dirtyPill = markDirty(updatedPill, 'upsert');
+    
+    // Update state
+    setPills(prevPills => prevPills.map(p => p.id === pillId ? dirtyPill : p));
+    
+    // Broadcast OUTSIDE the updater
+    if (broadcastChannelRef.current) {
+      broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, pillId));
+    }
+  }, [userId, markDirty, setPills]);
 
+  // N4 fix: markDirty and broadcast moved OUTSIDE the setPills updater
   const snoozeReminder = useCallback((pillId: string, reminderId: string, duration: number) => {
-    setPills(prevPills => prevPills.map(pill => {
-      if (pill.id === pillId) {
-        const reminder = pill.reminders.find(r => r.id === reminderId);
-        if (!reminder) return pill;
-        
-        const newHistoryEntry: HistoryEntry = {
-          id: `${Date.now()}-${reminderId}`,
-          reminderId: reminder.id,
-          pillName: pill.name,
-          time: reminder.time,
-          action: 'snoozed',
-          timestamp: Date.now(),
-        };
-        
-        const updatedReminders = pill.reminders.map(r =>
-          r.id === reminderId
-            ? { ...r, snoozedUntil: Date.now() + duration, taken: false }
-            : r
-        );
-        
-        const updatedPill: Pill = {
-          ...pill,
-          reminders: updatedReminders,
-          history: [...(pill.history || []), newHistoryEntry],
-        };
-        
-        // Mark as dirty for sync
-        const dirtyPill = markDirty(updatedPill, 'upsert');
-        broadcastPillChange('pill_changed', userId, dirtyPill.id);
-        return dirtyPill;
-      }
-      return pill;
-    }));
-  }, [userId, markDirty]);
+    // Compute the update using current state from ref
+    const currentPill = pillsRef.current.find(p => p.id === pillId);
+    if (!currentPill) return;
+    
+    const reminder = currentPill.reminders.find(r => r.id === reminderId);
+    if (!reminder) return;
+    
+    const newHistoryEntry: HistoryEntry = {
+      id: `${Date.now()}-${reminderId}`,
+      reminderId: reminder.id,
+      pillName: currentPill.name,
+      time: reminder.time,
+      action: 'snoozed',
+      timestamp: Date.now(),
+    };
+    
+    const updatedReminders = currentPill.reminders.map(r =>
+      r.id === reminderId
+        ? { ...r, snoozedUntil: Date.now() + duration, taken: false }
+        : r
+    );
+    
+    const updatedPill: Pill = {
+      ...currentPill,
+      reminders: updatedReminders,
+      history: [...(currentPill.history || []), newHistoryEntry],
+    };
+    
+    // Mark as dirty OUTSIDE the updater
+    const dirtyPill = markDirty(updatedPill, 'upsert');
+    
+    // Update state
+    setPills(prevPills => prevPills.map(p => p.id === pillId ? dirtyPill : p));
+    
+    // Broadcast OUTSIDE the updater
+    if (broadcastChannelRef.current) {
+      broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, pillId));
+    }
+  }, [userId, markDirty, setPills]);
 
   const deletePill = useCallback(async (pillId: string) => {
     const pill = pillsRef.current.find(p => p.id === pillId);
@@ -672,7 +695,9 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
     markDirty(pill, 'delete');
     
     // Broadcast delete to other tabs
-    broadcastPillChange('pill_deleted', userId, pillId);
+    if (broadcastChannelRef.current) {
+      broadcastChannelRef.current.postMessage(createSyncMessage('pill_deleted', userId, pillId));
+    }
     
     // Remove from local state
     setPills(prevPills => prevPills.filter(p => p.id !== pillId));

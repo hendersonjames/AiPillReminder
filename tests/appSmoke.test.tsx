@@ -379,38 +379,78 @@ describe('Behavior Tests: Sign-out Protection', () => {
     });
   });
 
-  it('signingOut flag blocks storage writes', async () => {
+  it('N8: flipping signingOut ref without rerender blocks storage writes', async () => {
     const mockLoadFromCloud = vi.fn().mockResolvedValue([]);
     setupSupabaseMocks();
     
-    const { result, rerender } = renderHook(
-      ({ signingOut }) => useSyncEngine({
-        userId,
-        loadPillsFromCloud: mockLoadFromCloud,
-        signingOut,
-      }),
-      { initialProps: { signingOut: false } }
-    );
+    // Create a ref that we control
+    const signingOutRef = { current: false };
+    
+    const { result } = renderHook(() => useSyncEngine({
+      userId,
+      loadPillsFromCloud: mockLoadFromCloud,
+      signingOutRef, // Pass ref directly
+    }));
     
     await waitFor(() => {
       expect(result.current.state.syncStatus).toBe('synced');
     });
     
-    // Set signing out
-    rerender({ signingOut: true });
-    
-    // Clear storage to test if new writes happen
+    // Clear storage
     localStorage.clear();
     
-    // Add a pill
+    // Flip the ref WITHOUT rerendering (N8: must read live)
+    signingOutRef.current = true;
+    
+    // Add a pill - this should trigger the persist effect
     const pill = createTestPill('pill-1', 'Test');
     act(() => {
       result.current.actions.setPills([pill]);
     });
     
-    // Storage should remain empty (writes blocked)
+    // Wait for the effect to run
+    await new Promise(r => setTimeout(r, 50));
+    
+    // Storage should remain empty because signingOut is now true (read live from ref)
     const stored = localStorage.getItem(`pills_${userId}`);
     expect(stored).toBeNull();
+  });
+  
+  it('N8: signingOut ref is read live in debounced upload effect', async () => {
+    const mockLoadFromCloud = vi.fn().mockResolvedValue([]);
+    const { selectFn } = setupSupabaseMocks();
+    
+    const signingOutRef = { current: false };
+    
+    const { result } = renderHook(() => useSyncEngine({
+      userId,
+      loadPillsFromCloud: mockLoadFromCloud,
+      signingOutRef,
+    }));
+    
+    await waitFor(() => {
+      expect(result.current.state.syncStatus).toBe('synced');
+    });
+    
+    // Clear call counts
+    selectFn.mockClear();
+    
+    // Add a dirty pill to trigger upload
+    const pill = createTestPill('pill-1', 'Test');
+    act(() => {
+      const dirtyPill = result.current.actions.markDirty(pill, 'upsert');
+      result.current.actions.setPills([dirtyPill]);
+    });
+    
+    // Flip signingOut BEFORE the debounce fires (1500ms)
+    signingOutRef.current = true;
+    
+    // Wait past the 1500ms debounce
+    await new Promise(r => setTimeout(r, 2000));
+    
+    // Upload should NOT have been called because signingOut was true
+    // (read live at effect execution time, not render time)
+    expect(selectFn).not.toHaveBeenCalled();
   });
 });
 
@@ -459,5 +499,129 @@ describe('Behavior Tests: Merge with Non-finite updatedAt', () => {
     
     // Cloud should win
     expect(result.pills[0].name).toBe('Cloud');
+  });
+});
+
+describe('T1: Merge must not keep deleted local pills', () => {
+  it('cloud tombstone removes pill from merge result', async () => {
+    const { mergePills } = await import('../lib/syncEngine');
+    
+    const localPill = createTestPill('pill-1', 'Local Edit');
+    localPill.updatedAt = Date.now();
+    
+    const cloudTombstone = createTestPill('pill-1', '');
+    cloudTombstone.deleted = true;
+    cloudTombstone.deletedAt = Date.now() - 1000;
+    cloudTombstone.updatedAt = Date.now() - 1000;
+    
+    // Local has an upsert in outbox (not a delete)
+    const outbox: OutboxEntry[] = [{
+      id: 'pill-1',
+      type: 'upsert',
+      pill: localPill,
+      updatedAt: localPill.updatedAt!,
+      userId: 'test',
+    }];
+    
+    const result = mergePills([localPill], [cloudTombstone], outbox);
+    
+    // Tombstone wins - pill should NOT appear in result
+    expect(result.pills.find(p => p.id === 'pill-1')).toBeUndefined();
+  });
+  
+  it('locally deleted pill is kept only if in outbox as delete', async () => {
+    const { mergePills, createTombstone } = await import('../lib/syncEngine');
+    
+    const localTombstone = createTombstone('pill-1');
+    
+    // Pill exists on cloud (not deleted)
+    const cloudPill = createTestPill('pill-1', 'Cloud');
+    cloudPill.updatedAt = Date.now() - 5000;
+    
+    // Local has a delete in outbox
+    const outbox: OutboxEntry[] = [{
+      id: 'pill-1',
+      type: 'delete',
+      pill: localTombstone,
+      updatedAt: localTombstone.updatedAt!,
+      userId: 'test',
+    }];
+    
+    const result = mergePills([localTombstone], [cloudPill], outbox);
+    
+    // Local delete wins - pill should be in result as tombstone (for upload)
+    // but filtered out of final display (deleted pills filtered)
+    expect(result.pills.find(p => p.id === 'pill-1')).toBeUndefined();
+  });
+});
+
+describe('L2: Upload-effect loop test', () => {
+  const userId = 'test-user';
+  
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+    vi.mocked(supabase.auth.getSession).mockResolvedValue({
+      data: { session: { user: { id: userId } } as any },
+      error: null,
+    });
+  });
+  
+  it('inline callback in upload effect deps would cause infinite loop (caught by stable design)', async () => {
+    const mockLoadFromCloud = vi.fn().mockResolvedValue([]);
+    const { selectFn } = setupSupabaseMocks();
+    
+    let renderCount = 0;
+    let uploadCount = 0;
+    
+    // Track uploads
+    selectFn.mockImplementation(() => {
+      uploadCount++;
+      return Promise.resolve({ data: [{ id: 'mock' }], error: null });
+    });
+    
+    const { result, rerender } = renderHook(() => {
+      renderCount++;
+      return useSyncEngine({
+        userId,
+        loadPillsFromCloud: mockLoadFromCloud,
+        // This inline callback changes identity every render
+        // If the upload effect depended on it, it would loop
+        onPillsChange: () => {},
+      });
+    });
+    
+    await waitFor(() => {
+      expect(result.current.state.syncStatus).toBe('synced');
+    });
+    
+    const initialUploadCount = uploadCount;
+    const initialRenderCount = renderCount;
+    
+    // Add a pill to trigger upload
+    const pill = createTestPill('pill-1', 'Test');
+    act(() => {
+      const dirtyPill = result.current.actions.markDirty(pill, 'upsert');
+      result.current.actions.setPills([dirtyPill]);
+    });
+    
+    // Wait for debounced flush
+    await new Promise(r => setTimeout(r, 2000));
+    
+    const uploadsAfterEdit = uploadCount - initialUploadCount;
+    
+    // Should have exactly 1 upload, not N uploads where N = render count
+    // If onPillsChange was in deps, each render would re-trigger the effect
+    expect(uploadsAfterEdit).toBe(1);
+    
+    // Rerender multiple times
+    for (let i = 0; i < 10; i++) {
+      rerender();
+    }
+    
+    await new Promise(r => setTimeout(r, 500));
+    
+    // No additional uploads from rerenders
+    expect(uploadCount - initialUploadCount).toBe(1);
   });
 });
