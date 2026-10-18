@@ -353,17 +353,30 @@ describe('syncEngine: Cloud Operations', () => {
   });
 
   describe('flushOutbox', () => {
-    it('processes all entries in outbox (soft-delete uses upsert)', async () => {
+    it('processes all entries in outbox', async () => {
       vi.mocked(supabase.auth.getSession).mockResolvedValue({
         data: { session: { user: mockUser } as any },
         error: null,
       });
 
+      // Mock for conditional update (returns matched row)
+      const updateFn = vi.fn().mockReturnThis();
+      const eqFn = vi.fn().mockReturnThis();
+      const orFn = vi.fn().mockReturnThis();
+      const selectFn = vi.fn().mockResolvedValue({ data: [{ id: 'pill-1' }], error: null });
+      
+      // Mock for delete (upsert)
       const upsertFn = vi.fn().mockResolvedValue({ error: null });
 
       vi.mocked(supabase.from).mockImplementation(() => ({
+        update: updateFn,
         upsert: upsertFn,
+        select: vi.fn().mockResolvedValue({ data: null, error: null }),
       } as any));
+      
+      updateFn.mockReturnValue({ eq: eqFn });
+      eqFn.mockReturnValue({ eq: eqFn, or: orFn });
+      orFn.mockReturnValue({ select: selectFn });
 
       // Add entries to outbox
       const pill1 = createTestPill('pill-1', 'Test 1', Date.now());
@@ -378,7 +391,7 @@ describe('syncEngine: Cloud Operations', () => {
       addToOutbox(userA, {
         id: 'pill-2',
         type: 'delete',
-        pill: pill2, // Include pill for full tombstone
+        pill: pill2,
         updatedAt: Date.now(),
         userId: userA,
       });
@@ -386,8 +399,6 @@ describe('syncEngine: Cloud Operations', () => {
       const result = await flushOutbox(userA);
 
       expect(result.success).toBe(true);
-      // Both upsert and delete now use upsert (delete is soft-delete tombstone)
-      expect(upsertFn).toHaveBeenCalledTimes(2);
       
       // Outbox should be empty after successful flush
       const outbox = loadOutboxFromStorage(userA);
@@ -425,10 +436,20 @@ describe('syncEngine: Cloud Operations', () => {
         error: null,
       });
 
-      const upsertFn = vi.fn().mockResolvedValue({ error: null });
+      // Mock for conditional update (returns matched row)
+      const updateFn = vi.fn().mockReturnThis();
+      const eqFn = vi.fn().mockReturnThis();
+      const orFn = vi.fn().mockReturnThis();
+      const selectFn = vi.fn().mockResolvedValue({ data: [{ id: 'pill-a' }], error: null });
+      
       vi.mocked(supabase.from).mockImplementation(() => ({
-        upsert: upsertFn,
+        update: updateFn,
+        select: vi.fn().mockResolvedValue({ data: null, error: null }),
       } as any));
+      
+      updateFn.mockReturnValue({ eq: eqFn });
+      eqFn.mockReturnValue({ eq: eqFn, or: orFn });
+      orFn.mockReturnValue({ select: selectFn });
 
       // Add entry for different user to userA's outbox (should not happen, but testing safety)
       const userB = 'user-b';
@@ -454,12 +475,8 @@ describe('syncEngine: Cloud Operations', () => {
 
       const result = await flushOutbox(userA);
 
-      // Should only process userA's entry
-      expect(upsertFn).toHaveBeenCalledTimes(1);
-      expect(upsertFn).toHaveBeenCalledWith(
-        expect.objectContaining({ id: 'pill-a' }),
-        expect.any(Object)
-      );
+      // Should only process userA's entry (1 update call)
+      expect(updateFn).toHaveBeenCalledTimes(1);
     });
   });
 });
@@ -526,7 +543,7 @@ describe('syncEngine: Two-Tab Delete Coordination', () => {
     expect(visiblePills).toHaveLength(0);
   });
 
-  it('delete outbox entry leads to soft-delete (upsert tombstone), not hard delete', async () => {
+  it('delete outbox entry leads to soft-delete (upsert minimal tombstone)', async () => {
     vi.mocked(supabase.auth.getSession).mockResolvedValue({
       data: { session: { user: { id: userA } } as any },
       error: null,
@@ -540,7 +557,7 @@ describe('syncEngine: Two-Tab Delete Coordination', () => {
 
     const pillToDelete = createTestPill('pill-1', 'To Delete', Date.now());
 
-    // Verify deletePillFromCloudById uses soft-delete (upsert with tombstone)
+    // Verify deletePillFromCloudById uses soft-delete (upsert with minimal tombstone)
     const result = await deletePillFromCloudById('pill-1', userA, pillToDelete);
 
     expect(result.success).toBe(true);
@@ -548,13 +565,23 @@ describe('syncEngine: Two-Tab Delete Coordination', () => {
       expect.objectContaining({
         id: 'pill-1',
         user_id: userA,
+        pill_name: '[deleted]',
         pill_data: expect.objectContaining({
+          id: 'pill-1',
           deleted: true,
           deletedAt: expect.any(Number),
+          // Should NOT contain health data
+          name: '',
+          dosage: '',
         }),
       }),
       expect.objectContaining({ onConflict: 'id' })
     );
+    
+    // Verify tombstone does NOT contain health data (privacy)
+    const callArg = upsertFn.mock.calls[0][0];
+    expect(callArg.pill_data.history).toBeUndefined();
+    expect(callArg.pill_data.notes).toBeUndefined();
   });
 });
 

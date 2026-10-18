@@ -286,6 +286,8 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   const pendingNotifTapsRef = useRef<QueuedTap[]>([]);
   // Track if missed dose sweep has run after this load
   const missedSweepDoneRef = useRef(false);
+  // Track if we just flushed (to avoid duplicate debounced flush)
+  const justFlushedRef = useRef(false);
 
   const [pills, setPills] = useState<Pill[]>([]);
 
@@ -345,22 +347,17 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   // ─── Multi-tab coordination via BroadcastChannel ────────────────────────────
   useEffect(() => {
     const handleSyncMessage = (msg: SyncMessage) => {
-      // Ignore messages from other users
+      // Channel is per-user, but double-check
       if (msg.userId !== userId) return;
       
-      if (msg.type === 'pill_changed' && msg.pill) {
-        // Another tab changed a pill - update our state if not in outbox
+      if (msg.type === 'pill_changed' && msg.pillId) {
+        // Another tab changed a pill - reload from local storage to get latest
+        // (We don't send pill data over channel for privacy)
         const outbox = loadOutboxFromStorage(userId);
         const inOurOutbox = outbox.some(e => e.id === msg.pillId);
         if (!inOurOutbox) {
-          setPills(prevPills => {
-            const exists = prevPills.some(p => p.id === msg.pillId);
-            if (exists) {
-              return prevPills.map(p => p.id === msg.pillId ? msg.pill! : p);
-            } else {
-              return [...prevPills, msg.pill!];
-            }
-          });
+          const refreshedPills = loadPillsFromStorage(userId);
+          setPills(enhancePillsWithDerivedStatus(refreshedPills));
         }
       } else if (msg.type === 'pill_deleted' && msg.pillId) {
         // Another tab deleted a pill - remove from our state
@@ -372,7 +369,7 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       }
     };
     
-    const cleanup = initBroadcastChannel(handleSyncMessage);
+    const cleanup = initBroadcastChannel(userId, handleSyncMessage);
     return cleanup;
   }, [userId]);
 
@@ -393,6 +390,14 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
     // Flush the outbox (per-pill upserts/deletes only)
     try {
       const result = await flushOutbox(userId);
+      
+      // If any pills were tombstoned (deleted elsewhere), drop them locally
+      if (result.tombstonedIds && result.tombstonedIds.length > 0) {
+        setPills(prevPills => 
+          prevPills.filter(p => !result.tombstonedIds!.includes(p.id))
+        );
+      }
+      
       if (result.success) {
         setPendingSync(userId, false);
         return true;
@@ -506,6 +511,7 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
         // Flush outbox (includes local changes + tapped pills)
         const currentOutbox = loadOutboxFromStorage(userId);
         if (currentOutbox.length > 0 || hasLocalChanges) {
+          justFlushedRef.current = true; // Prevent duplicate debounced flush
           const flushResult = await flushOutbox(userId);
           if (flushResult.success) {
             setSyncStatus('synced');
@@ -564,6 +570,12 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
     if (!cloudLoadSucceededRef.current) return;
     if (loadedForUserIdRef.current !== userId) return;
     
+    // Skip if we just flushed (prevents duplicate upload after load)
+    if (justFlushedRef.current) {
+      justFlushedRef.current = false;
+      return;
+    }
+    
     // Check if outbox has items to sync
     const outbox = loadOutboxFromStorage(userId);
     if (outbox.length === 0) return;
@@ -587,6 +599,13 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
           console.warn('Sync aborted:', result.error);
           setSyncStatus('error');
           return;
+        }
+        
+        // If any pills were tombstoned (deleted elsewhere), drop them locally
+        if (result.tombstonedIds && result.tombstonedIds.length > 0) {
+          setPills(prevPills => 
+            prevPills.filter(p => !result.tombstonedIds!.includes(p.id))
+          );
         }
         
         if (result.success) {
@@ -763,8 +782,8 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       
       setPills(prevPills => prevPills.map(p => (p.id === savedPill.id ? savedPill : p)));
       
-      // Broadcast change to other tabs
-      broadcastPillChange('pill_changed', userId, savedPill.id, savedPill);
+      // Broadcast change to other tabs (pillId only, no data)
+      broadcastPillChange('pill_changed', userId, savedPill.id);
       
       // Cancel old notifications and reschedule
       if (isNative()) {
@@ -779,7 +798,11 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       }
     } else {
       const now = Date.now();
-      savedPill = { ...pillData, id: now.toString(), history: [], createdAt: now };
+      // Use crypto.randomUUID() for new pills (better uniqueness than timestamps)
+      const newId = typeof crypto !== 'undefined' && crypto.randomUUID 
+        ? crypto.randomUUID() 
+        : now.toString(); // Fallback for old browsers
+      savedPill = { ...pillData, id: newId, history: [], createdAt: now };
       savedPill.reminders = savedPill.reminders.map(r => ({
         ...r,
         taken: false,
@@ -790,8 +813,8 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       
       setPills(prevPills => [...prevPills, savedPill]);
       
-      // Broadcast change to other tabs
-      broadcastPillChange('pill_changed', userId, savedPill.id, savedPill);
+      // Broadcast change to other tabs (pillId only, no data)
+      broadcastPillChange('pill_changed', userId, savedPill.id);
       
       // Schedule notifications for new pill
       if (isNative()) {
@@ -854,7 +877,7 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
         
         // Mark as dirty for sync
         const dirtyPill = markPillDirty(userId, updatedPill, 'upsert');
-        broadcastPillChange('pill_changed', userId, dirtyPill.id, dirtyPill);
+        broadcastPillChange('pill_changed', userId, dirtyPill.id);
         return dirtyPill;
       }
       return pill;
@@ -890,7 +913,7 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
         
         // Mark as dirty for sync
         const dirtyPill = markPillDirty(userId, updatedPill, 'upsert');
-        broadcastPillChange('pill_changed', userId, dirtyPill.id, dirtyPill);
+        broadcastPillChange('pill_changed', userId, dirtyPill.id);
         return dirtyPill;
       }
       return pill;

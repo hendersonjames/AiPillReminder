@@ -113,58 +113,113 @@ describe('pillsService', () => {
   });
 
   describe('upsertPillToCloud', () => {
-    it('upserts a single pill with user verification', async () => {
+    it('updates existing pill with conditional update (tombstone protection)', async () => {
       vi.mocked(supabase.auth.getSession).mockResolvedValue({
         data: { session: { user: mockUser } as any },
         error: null,
       });
 
-      const upsertFn = vi.fn().mockResolvedValue({ error: null });
+      // Mock conditional update that matches (row exists, not tombstoned)
+      const updateFn = vi.fn().mockReturnThis();
+      const eqFn = vi.fn().mockReturnThis();
+      const orFn = vi.fn().mockReturnThis();
+      const selectFn = vi.fn().mockResolvedValue({ data: [{ id: 'p1' }], error: null });
 
       vi.mocked(supabase.from).mockReturnValue({
-        upsert: upsertFn,
+        update: updateFn,
       } as any);
+      
+      updateFn.mockReturnValue({ eq: eqFn });
+      eqFn.mockReturnValue({ eq: eqFn, or: orFn });
+      orFn.mockReturnValue({ select: selectFn });
 
       const pill = createTestPill('p1', 'Test Pill', Date.now());
       const result = await upsertPillToCloud(pill, mockUserId);
 
       expect(result.success).toBe(true);
-      expect(upsertFn).toHaveBeenCalledWith(
+      expect(updateFn).toHaveBeenCalledWith(
         expect.objectContaining({
-          id: 'p1',
-          user_id: mockUserId,
           pill_name: 'Test Pill',
-        }),
-        expect.objectContaining({ onConflict: 'id' })
+          pill_data: expect.objectContaining({ id: 'p1' }),
+        })
       );
     });
 
-    it('rejects empty pill body', async () => {
+    it('inserts new pill when row does not exist', async () => {
       vi.mocked(supabase.auth.getSession).mockResolvedValue({
         data: { session: { user: mockUser } as any },
         error: null,
       });
 
-      const upsertFn = vi.fn().mockResolvedValue({ error: null });
+      // Mock conditional update that matches 0 rows
+      const updateFn = vi.fn().mockReturnThis();
+      const eqFn = vi.fn().mockReturnThis();
+      const orFn = vi.fn().mockReturnThis();
+      const selectUpdateFn = vi.fn().mockResolvedValue({ data: [], error: null });
+      
+      // Mock select to check if row exists (returns null = doesn't exist)
+      const selectCheckFn = vi.fn().mockReturnThis();
+      const selectEqFn = vi.fn().mockReturnThis();
+      const singleFn = vi.fn().mockResolvedValue({ data: null, error: null });
+      
+      // Mock insert
+      const insertFn = vi.fn().mockResolvedValue({ error: null });
 
       vi.mocked(supabase.from).mockReturnValue({
-        upsert: upsertFn,
+        update: updateFn,
+        select: selectCheckFn,
+        insert: insertFn,
       } as any);
+      
+      updateFn.mockReturnValue({ eq: eqFn });
+      eqFn.mockReturnValue({ eq: eqFn, or: orFn });
+      orFn.mockReturnValue({ select: selectUpdateFn });
+      selectCheckFn.mockReturnValue({ eq: selectEqFn });
+      selectEqFn.mockReturnValue({ eq: selectEqFn, single: singleFn });
 
-      // Create a pill and verify the upsert includes pill_data
       const pill = createTestPill('p1', 'Test Pill', Date.now());
-      await upsertPillToCloud(pill, mockUserId);
+      const result = await upsertPillToCloud(pill, mockUserId);
 
-      // Verify pill_data is included and not empty
-      expect(upsertFn).toHaveBeenCalledWith(
-        expect.objectContaining({
-          pill_data: expect.objectContaining({
-            id: 'p1',
-            name: 'Test Pill',
-          }),
-        }),
-        expect.any(Object)
-      );
+      expect(result.success).toBe(true);
+      expect(insertFn).toHaveBeenCalled();
+    });
+
+    it('returns tombstoned=true when writing to tombstoned row', async () => {
+      vi.mocked(supabase.auth.getSession).mockResolvedValue({
+        data: { session: { user: mockUser } as any },
+        error: null,
+      });
+
+      // Mock conditional update that matches 0 rows
+      const updateFn = vi.fn().mockReturnThis();
+      const eqFn = vi.fn().mockReturnThis();
+      const orFn = vi.fn().mockReturnThis();
+      const selectUpdateFn = vi.fn().mockResolvedValue({ data: [], error: null });
+      
+      // Mock select to check if row exists (returns tombstoned row)
+      const selectCheckFn = vi.fn().mockReturnThis();
+      const selectEqFn = vi.fn().mockReturnThis();
+      const singleFn = vi.fn().mockResolvedValue({ 
+        data: { pill_data: { deleted: true } }, 
+        error: null 
+      });
+
+      vi.mocked(supabase.from).mockReturnValue({
+        update: updateFn,
+        select: selectCheckFn,
+      } as any);
+      
+      updateFn.mockReturnValue({ eq: eqFn });
+      eqFn.mockReturnValue({ eq: eqFn, or: orFn });
+      orFn.mockReturnValue({ select: selectUpdateFn });
+      selectCheckFn.mockReturnValue({ eq: selectEqFn });
+      selectEqFn.mockReturnValue({ eq: selectEqFn, single: singleFn });
+
+      const pill = createTestPill('p1', 'Test Pill', Date.now());
+      const result = await upsertPillToCloud(pill, mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.tombstoned).toBe(true);
     });
 
     it('aborts if user changed', async () => {
@@ -182,7 +237,7 @@ describe('pillsService', () => {
   });
 
   describe('deletePillFromCloudById', () => {
-    it('soft-deletes a pill by upserting tombstone', async () => {
+    it('soft-deletes with minimal tombstone (no health data)', async () => {
       vi.mocked(supabase.auth.getSession).mockResolvedValue({
         data: { session: { user: mockUser } as any },
         error: null,
@@ -194,21 +249,23 @@ describe('pillsService', () => {
         upsert: upsertFn,
       } as any);
 
+      // Even when pill is provided, tombstone should be minimal
       const pill = createTestPill('p1', 'Test Pill');
+      pill.notes = 'Secret health notes';
+      pill.history = [{ id: 'h1', reminderId: 'r1', pillName: 'Test', time: '09:00', action: 'taken', timestamp: Date.now() }];
+      
       const result = await deletePillFromCloudById('p1', mockUserId, pill);
 
       expect(result.success).toBe(true);
-      expect(upsertFn).toHaveBeenCalledWith(
-        expect.objectContaining({
-          id: 'p1',
-          user_id: mockUserId,
-          pill_data: expect.objectContaining({
-            deleted: true,
-            deletedAt: expect.any(Number),
-          }),
-        }),
-        expect.objectContaining({ onConflict: 'id' })
-      );
+      
+      const callArg = upsertFn.mock.calls[0][0];
+      expect(callArg.pill_name).toBe('[deleted]');
+      expect(callArg.pill_data.deleted).toBe(true);
+      expect(callArg.pill_data.deletedAt).toBeDefined();
+      // Privacy: should NOT contain health data
+      expect(callArg.pill_data.name).toBe('');
+      expect(callArg.pill_data.notes).toBeUndefined();
+      expect(callArg.pill_data.history).toBeUndefined();
     });
 
     it('returns error on deletion failure', async () => {
@@ -229,7 +286,7 @@ describe('pillsService', () => {
       expect(result.error).toBe('Upsert failed');
     });
 
-    it('creates minimal tombstone when pill is not provided', async () => {
+    it('creates same minimal tombstone with or without pill param', async () => {
       vi.mocked(supabase.auth.getSession).mockResolvedValue({
         data: { session: { user: mockUser } as any },
         error: null,
@@ -241,9 +298,9 @@ describe('pillsService', () => {
         upsert: upsertFn,
       } as any);
 
-      const result = await deletePillFromCloudById('p1', mockUserId);
+      // Call without pill
+      await deletePillFromCloudById('p1', mockUserId);
 
-      expect(result.success).toBe(true);
       expect(upsertFn).toHaveBeenCalledWith(
         expect.objectContaining({
           id: 'p1',
@@ -253,6 +310,8 @@ describe('pillsService', () => {
             id: 'p1',
             deleted: true,
             deletedAt: expect.any(Number),
+            name: '',
+            dosage: '',
           }),
         }),
         expect.objectContaining({ onConflict: 'id' })
@@ -267,10 +326,19 @@ describe('pillsService', () => {
         error: null,
       });
 
-      const upsertFn = vi.fn().mockResolvedValue({ error: null });
+      // Mock for conditional update (returns matched row)
+      const updateFn = vi.fn().mockReturnThis();
+      const eqFn = vi.fn().mockReturnThis();
+      const orFn = vi.fn().mockReturnThis();
+      const selectFn = vi.fn().mockResolvedValue({ data: [{ id: 'p1' }], error: null });
+
       vi.mocked(supabase.from).mockReturnValue({
-        upsert: upsertFn,
+        update: updateFn,
       } as any);
+      
+      updateFn.mockReturnValue({ eq: eqFn });
+      eqFn.mockReturnValue({ eq: eqFn, or: orFn });
+      orFn.mockReturnValue({ select: selectFn });
 
       // Add entries to outbox
       const pill = createTestPill('p1', 'Test', Date.now());
@@ -300,10 +368,19 @@ describe('pillsService', () => {
         error: null,
       });
 
-      const upsertFn = vi.fn().mockResolvedValue({ error: { message: 'Upload failed' } });
+      // Mock for conditional update that fails
+      const updateFn = vi.fn().mockReturnThis();
+      const eqFn = vi.fn().mockReturnThis();
+      const orFn = vi.fn().mockReturnThis();
+      const selectFn = vi.fn().mockResolvedValue({ data: null, error: { message: 'Upload failed' } });
+
       vi.mocked(supabase.from).mockReturnValue({
-        upsert: upsertFn,
+        update: updateFn,
       } as any);
+      
+      updateFn.mockReturnValue({ eq: eqFn });
+      eqFn.mockReturnValue({ eq: eqFn, or: orFn });
+      orFn.mockReturnValue({ select: selectFn });
 
       // Add entry to outbox
       const pill = createTestPill('p1', 'Test', Date.now());
@@ -336,12 +413,12 @@ describe('pillsService', () => {
         upsert: upsertFn,
       } as any);
 
-      // Add delete entry to outbox with pill data for full tombstone
+      // Add delete entry to outbox
       const pill = createTestPill('p1', 'Test Pill');
       const entry: OutboxEntry = {
         id: 'p1',
         type: 'delete',
-        pill, // Include pill for full tombstone
+        pill,
         updatedAt: Date.now(),
         userId: mockUserId,
       };
@@ -351,13 +428,16 @@ describe('pillsService', () => {
       const result = await flushOutbox(mockUserId);
 
       expect(result.success).toBe(true);
-      // Delete now uses upsert with tombstone
+      // Delete uses upsert with minimal tombstone (no health data)
       expect(upsertFn).toHaveBeenCalledWith(
         expect.objectContaining({
           id: 'p1',
+          pill_name: '[deleted]',
           pill_data: expect.objectContaining({
+            id: 'p1',
             deleted: true,
             deletedAt: expect.any(Number),
+            name: '',
           }),
         }),
         expect.any(Object)
@@ -371,10 +451,19 @@ describe('pillsService', () => {
         error: null,
       });
 
-      const upsertFn = vi.fn().mockResolvedValue({ error: null });
+      // Mock for conditional update (returns matched row)
+      const updateFn = vi.fn().mockReturnThis();
+      const eqFn = vi.fn().mockReturnThis();
+      const orFn = vi.fn().mockReturnThis();
+      const selectFn = vi.fn().mockResolvedValue({ data: [{ id: 'p1' }], error: null });
+
       vi.mocked(supabase.from).mockReturnValue({
-        upsert: upsertFn,
+        update: updateFn,
       } as any);
+      
+      updateFn.mockReturnValue({ eq: eqFn });
+      eqFn.mockReturnValue({ eq: eqFn, or: orFn });
+      orFn.mockReturnValue({ select: selectFn });
 
       // Add single entry
       const pill = createTestPill('p1', 'Test', Date.now());
@@ -392,7 +481,7 @@ describe('pillsService', () => {
       await flushOutbox(mockUserId);
 
       // Should only have uploaded once (second flush has empty outbox)
-      expect(upsertFn).toHaveBeenCalledTimes(1);
+      expect(updateFn).toHaveBeenCalledTimes(1);
     });
   });
 });

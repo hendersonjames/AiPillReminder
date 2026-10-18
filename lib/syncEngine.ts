@@ -111,62 +111,130 @@ const verifySessionUser = async (expectedUserId: string): Promise<boolean> => {
   return session?.user?.id === expectedUserId;
 };
 
+export interface UpsertResult extends SyncResult {
+  tombstoned?: boolean; // True if the row was a tombstone and write was blocked
+}
+
+// Upsert pill to cloud with tombstone protection:
+// - For existing rows: conditional update that only succeeds if NOT tombstoned
+// - For new rows: insert only (never overwrite a tombstone with same id)
+// This prevents stale browsers from resurrecting deleted pills
 export const upsertPillToCloud = async (
   pill: Pill,
   expectedUserId: string
-): Promise<SyncResult> => {
+): Promise<UpsertResult> => {
   if (!await verifySessionUser(expectedUserId)) {
     return { success: false, error: 'User changed', aborted: true };
   }
 
-  const { error } = await supabase.from('pills').upsert({
-    id: pill.id,
-    user_id: expectedUserId,
-    pill_name: pill.name,
-    pill_data: pill,
-    updated_at: pill.updatedAt ? new Date(pill.updatedAt).toISOString() : new Date().toISOString(),
-  }, {
-    onConflict: 'id',
-  });
+  const updatedAt = pill.updatedAt 
+    ? new Date(pill.updatedAt).toISOString() 
+    : new Date().toISOString();
 
-  if (error) {
-    return { success: false, error: error.message };
+  // First, try to UPDATE existing row only if it's NOT tombstoned
+  // This prevents stale browsers from resurrecting deleted pills
+  const { data: updateData, error: updateError } = await supabase
+    .from('pills')
+    .update({
+      pill_name: pill.name,
+      pill_data: pill,
+      updated_at: updatedAt,
+    })
+    .eq('id', pill.id)
+    .eq('user_id', expectedUserId)
+    .or('pill_data->>deleted.is.null,pill_data->>deleted.neq.true')
+    .select('id');
+
+  if (updateError) {
+    return { success: false, error: updateError.message };
   }
+
+  // If update matched a row, we're done
+  if (updateData && updateData.length > 0) {
+    return { success: true };
+  }
+
+  // Update matched 0 rows - either row doesn't exist OR it's tombstoned
+  // Check if row exists and is tombstoned
+  const { data: existingRow } = await supabase
+    .from('pills')
+    .select('pill_data')
+    .eq('id', pill.id)
+    .eq('user_id', expectedUserId)
+    .single();
+
+  if (existingRow) {
+    // Row exists but update didn't match - must be tombstoned
+    // Return tombstoned=true so caller can drop the pill locally
+    return { success: false, tombstoned: true, error: 'Pill was deleted' };
+  }
+
+  // Row doesn't exist - INSERT new row
+  const { error: insertError } = await supabase
+    .from('pills')
+    .insert({
+      id: pill.id,
+      user_id: expectedUserId,
+      pill_name: pill.name,
+      pill_data: pill,
+      updated_at: updatedAt,
+    });
+
+  if (insertError) {
+    // Handle race condition: another client inserted between our check and insert
+    if (insertError.code === '23505') { // unique_violation
+      // Row was inserted by another client - check if it's tombstoned
+      const { data: raceRow } = await supabase
+        .from('pills')
+        .select('pill_data')
+        .eq('id', pill.id)
+        .eq('user_id', expectedUserId)
+        .single();
+      
+      if (raceRow?.pill_data?.deleted) {
+        return { success: false, tombstoned: true, error: 'Pill was deleted' };
+      }
+      // Another client inserted a non-tombstone - that's fine, they win
+      return { success: true };
+    }
+    return { success: false, error: insertError.message };
+  }
+
   return { success: true };
 };
 
-// Soft-delete: upsert with deleted tombstone instead of hard DELETE
+// Create a minimal tombstone with NO health data (privacy)
+// Only keeps: id, deleted, deletedAt, updatedAt
+export const createTombstone = (pillId: string, now: number = Date.now()): Pill => ({
+  id: pillId,
+  name: '',
+  dosage: '',
+  reminders: [],
+  deleted: true,
+  deletedAt: now,
+  updatedAt: now,
+});
+
+// Soft-delete: upsert with minimal tombstone instead of hard DELETE
 // This prevents resurrection from stale browsers that still have the pill
 // Tombstone-wins: a tombstoned row cannot be revived by a non-delete edit
+// PRIVACY: Tombstone contains NO health data (name, dosage, history, notes stripped)
 export const deletePillFromCloudById = async (
   pillId: string,
   expectedUserId: string,
-  pill?: Pill
+  _pill?: Pill // Ignored - we never keep pill data in tombstones
 ): Promise<SyncResult> => {
   if (!await verifySessionUser(expectedUserId)) {
     return { success: false, error: 'User changed', aborted: true };
   }
 
   const now = Date.now();
-  const tombstone: Pill = pill ? {
-    ...pill,
-    deleted: true,
-    deletedAt: now,
-    updatedAt: now,
-  } : {
-    id: pillId,
-    name: '',
-    dosage: '',
-    reminders: [],
-    deleted: true,
-    deletedAt: now,
-    updatedAt: now,
-  };
+  const tombstone = createTombstone(pillId, now);
 
   const { error } = await supabase.from('pills').upsert({
     id: pillId,
     user_id: expectedUserId,
-    pill_name: tombstone.name || '[deleted]',
+    pill_name: '[deleted]',
     pill_data: tombstone,
     updated_at: new Date(now).toISOString(),
   }, {
@@ -181,21 +249,26 @@ export const deletePillFromCloudById = async (
 
 // ─── Outbox Processing ────────────────────────────────────────────────────────
 
-export const flushOutbox = async (userId: string): Promise<SyncResult> => {
+export interface FlushResult extends SyncResult {
+  tombstonedIds?: string[]; // IDs that were tombstoned and should be dropped locally
+}
+
+export const flushOutbox = async (userId: string): Promise<FlushResult> => {
   const outbox = loadOutboxFromStorage(userId);
   if (outbox.length === 0) {
     return { success: true };
   }
 
   const errors: string[] = [];
+  const tombstonedIds: string[] = [];
 
   for (const entry of outbox) {
     if (entry.userId !== userId) continue;
 
-    let result: SyncResult;
+    let result: UpsertResult;
     if (entry.type === 'delete') {
-      // Pass pill for full tombstone data (preserves history, etc.)
-      result = await deletePillFromCloudById(entry.id, userId, entry.pill);
+      // No need to pass pill - tombstones are minimal (privacy)
+      result = await deletePillFromCloudById(entry.id, userId);
     } else if (entry.pill) {
       result = await upsertPillToCloud(entry.pill, userId);
     } else {
@@ -209,15 +282,19 @@ export const flushOutbox = async (userId: string): Promise<SyncResult> => {
 
     if (result.success) {
       removeFromOutbox(userId, entry.id);
+    } else if (result.tombstoned) {
+      // Row is tombstoned - remove from outbox and tell caller to drop locally
+      removeFromOutbox(userId, entry.id);
+      tombstonedIds.push(entry.id);
     } else {
       errors.push(result.error || 'Unknown error');
     }
   }
 
   if (errors.length > 0) {
-    return { success: false, error: errors.join('; ') };
+    return { success: false, error: errors.join('; '), tombstonedIds };
   }
-  return { success: true };
+  return { success: true, tombstonedIds };
 };
 
 // ─── Local Change Tracking ────────────────────────────────────────────────────
@@ -228,17 +305,18 @@ export const markPillDirty = (
   type: 'upsert' | 'delete'
 ): Pill => {
   const now = Date.now();
-  const updated: Pill = {
-    ...pill,
-    updatedAt: now,
-    deleted: type === 'delete' ? true : undefined,
-    deletedAt: type === 'delete' ? now : undefined,
-  };
+  
+  // For delete: create minimal tombstone with NO health data (privacy)
+  // For upsert: keep full pill data
+  const updated: Pill = type === 'delete' 
+    ? createTombstone(pill.id, now)
+    : { ...pill, updatedAt: now };
 
   const entry: OutboxEntry = {
     id: pill.id,
     type,
-    // Include pill for both upsert and delete (delete needs it for full tombstone)
+    // For delete: minimal tombstone only (privacy)
+    // For upsert: full pill data
     pill: updated,
     updatedAt: now,
     userId,
@@ -255,29 +333,54 @@ export const hasUnsyncedChanges = (userId: string): boolean => {
 
 // ─── Multi-Tab Coordination ───────────────────────────────────────────────────
 
-const SYNC_CHANNEL_NAME = 'remedi_sync_channel';
+// Per-user channel name to prevent cross-user message leakage
+const getSyncChannelName = (userId: string): string => `remedi_sync_${userId}`;
 
+// Message shape: only pillId, no pill data (privacy + bandwidth)
 export interface SyncMessage {
   type: 'pill_changed' | 'pill_deleted' | 'pills_loaded';
   pillId?: string;
-  pill?: Pill;
   userId: string;
   timestamp: number;
 }
 
+// Validate incoming message shape
+const isValidSyncMessage = (data: unknown): data is SyncMessage => {
+  if (!data || typeof data !== 'object') return false;
+  const msg = data as Record<string, unknown>;
+  
+  if (typeof msg.type !== 'string') return false;
+  if (!['pill_changed', 'pill_deleted', 'pills_loaded'].includes(msg.type)) return false;
+  if (typeof msg.userId !== 'string') return false;
+  if (typeof msg.timestamp !== 'number') return false;
+  if (msg.pillId !== undefined && typeof msg.pillId !== 'string') return false;
+  
+  return true;
+};
+
 let broadcastChannel: BroadcastChannel | null = null;
+let currentChannelUserId: string | null = null;
 
 export const initBroadcastChannel = (
+  userId: string,
   onMessage: (msg: SyncMessage) => void
 ): (() => void) => {
   if (typeof BroadcastChannel === 'undefined') {
     return () => {};
   }
 
-  broadcastChannel = new BroadcastChannel(SYNC_CHANNEL_NAME);
+  // Close existing channel if user changed
+  if (broadcastChannel && currentChannelUserId !== userId) {
+    broadcastChannel.close();
+    broadcastChannel = null;
+  }
+
+  currentChannelUserId = userId;
+  broadcastChannel = new BroadcastChannel(getSyncChannelName(userId));
   broadcastChannel.onmessage = (event) => {
-    if (event.data && typeof event.data === 'object') {
-      onMessage(event.data as SyncMessage);
+    // Validate message shape before processing
+    if (isValidSyncMessage(event.data)) {
+      onMessage(event.data);
     }
   };
 
@@ -285,6 +388,7 @@ export const initBroadcastChannel = (
     if (broadcastChannel) {
       broadcastChannel.close();
       broadcastChannel = null;
+      currentChannelUserId = null;
     }
   };
 };
@@ -292,15 +396,14 @@ export const initBroadcastChannel = (
 export const broadcastPillChange = (
   type: 'pill_changed' | 'pill_deleted',
   userId: string,
-  pillId: string,
-  pill?: Pill
+  pillId: string
 ): void => {
-  if (!broadcastChannel) return;
+  if (!broadcastChannel || currentChannelUserId !== userId) return;
   
+  // Only send pillId, not pill data (privacy + bandwidth)
   const msg: SyncMessage = {
     type,
     pillId,
-    pill,
     userId,
     timestamp: Date.now(),
   };
@@ -313,7 +416,7 @@ export const broadcastPillChange = (
 };
 
 export const broadcastPillsLoaded = (userId: string): void => {
-  if (!broadcastChannel) return;
+  if (!broadcastChannel || currentChannelUserId !== userId) return;
   
   const msg: SyncMessage = {
     type: 'pills_loaded',
