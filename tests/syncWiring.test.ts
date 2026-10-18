@@ -454,3 +454,178 @@ describe('Deduplication', () => {
     expect(outbox[0].pill?.name).toBe('Edit 3');
   });
 });
+
+// ─── H4, H5, H6, HU2 Mutation Tests ─────────────────────────────────────────────
+
+describe('H4: Queued taps must be saved to localStorage', () => {
+  const userId = 'test-user';
+  
+  beforeEach(() => {
+    localStorage.clear();
+  });
+  
+  it('FAILS if addQueuedTap does not persist tap', () => {
+    addQueuedTap(userId, { pillId: 'p1', reminderId: 'r1', userId });
+    
+    // Clear in-memory state by creating fresh load
+    const loaded = loadQueuedTapsFromStorage(userId);
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0].pillId).toBe('p1');
+  });
+  
+  it('FAILS if taps are lost after reload', () => {
+    addQueuedTap(userId, { pillId: 'p1', reminderId: 'r1', userId });
+    addQueuedTap(userId, { pillId: 'p2', reminderId: 'r1', userId });
+    
+    const loaded = loadQueuedTapsFromStorage(userId);
+    expect(loaded).toHaveLength(2);
+  });
+});
+
+describe('H5: No upload after load (flush must happen)', () => {
+  const userId = 'test-user';
+  const mockLoadFromCloud = vi.fn();
+  
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+    
+    vi.mocked(supabase.auth.getSession).mockResolvedValue({
+      data: { session: { user: { id: userId } } as any },
+      error: null,
+    });
+  });
+  
+  it('FAILS if outbox items are not flushed after load', async () => {
+    const localPill = createTestPill('pill-1', 'Local Edit', Date.now());
+    savePillsToStorage(userId, [localPill]);
+    
+    const outboxEntry: OutboxEntry = {
+      id: 'pill-1',
+      type: 'upsert',
+      pill: localPill,
+      updatedAt: localPill.updatedAt!,
+      userId,
+    };
+    saveOutboxToStorage(userId, [outboxEntry]);
+    
+    mockLoadFromCloud.mockResolvedValue([]);
+    
+    // Track upsert calls
+    const upsertCalls: any[] = [];
+    const updateFn = vi.fn().mockReturnThis();
+    const eqFn = vi.fn().mockReturnThis();
+    const orFn = vi.fn().mockReturnThis();
+    const selectFn = vi.fn().mockImplementation(() => {
+      upsertCalls.push('update');
+      return Promise.resolve({ data: [{ id: 'pill-1' }], error: null });
+    });
+    vi.mocked(supabase.from).mockReturnValue({
+      update: updateFn,
+      select: vi.fn().mockResolvedValue({ data: null, error: null }),
+    } as any);
+    updateFn.mockReturnValue({ eq: eqFn });
+    eqFn.mockReturnValue({ eq: eqFn, or: orFn });
+    orFn.mockReturnValue({ select: selectFn });
+    
+    const { result } = renderHook(() => useSyncEngine({
+      userId,
+      loadPillsFromCloud: mockLoadFromCloud,
+    }));
+    
+    await waitFor(() => {
+      expect(result.current.state.syncStatus).toBe('synced');
+    });
+    
+    // Flush should have been called (update was invoked)
+    expect(upsertCalls.length).toBeGreaterThan(0);
+  });
+});
+
+describe('H6: Swept or tapped pills must be queued for upload', () => {
+  it('FAILS if orchestrateAfterCloudLoad does not return changedPillIds', async () => {
+    const { orchestrateAfterCloudLoad } = await import('../lib/loadOrchestration');
+    const weekAgo = new Date();
+    weekAgo.setDate(weekAgo.getDate() - 7);
+    const pill = createTestPill('p1', 'Old Pill', weekAgo.getTime());
+    
+    const threeDaysAgo = new Date();
+    threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
+    const lastSweep = getDateString(threeDaysAgo);
+    
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayStr = getDateString(yesterday);
+    
+    const result = orchestrateAfterCloudLoad(
+      [pill],
+      lastSweep,
+      yesterdayStr,
+      [],
+      'user-a',
+      recordMissedDoses
+    );
+    
+    // Sweep should mark pill as changed
+    expect(result.sweepRan).toBe(true);
+    expect(result.changedPillIds.has('p1')).toBe(true);
+  });
+  
+  it('FAILS if tapped pills are not included in changedPillIds', async () => {
+    const { orchestrateAfterCloudLoad } = await import('../lib/loadOrchestration');
+    const pill = createTestPill('p1', 'Pill');
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayStr = getDateString(yesterday);
+    
+    const taps: QueuedTap[] = [
+      { pillId: 'p1', reminderId: 'r1', userId: 'user-a' },
+    ];
+    
+    const result = orchestrateAfterCloudLoad(
+      [pill],
+      yesterdayStr,
+      yesterdayStr,
+      taps,
+      'user-a',
+      recordMissedDoses
+    );
+    
+    expect(result.changedPillIds.has('p1')).toBe(true);
+  });
+});
+
+describe('HU2: Regular outbox upload must work', () => {
+  const userId = 'test-user';
+  
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+  
+  it('FAILS if outbox entries are not created for dirty pills', () => {
+    // This tests the critical path: markPillDirty creates outbox entries
+    // which the debounced flush will process
+    const pill = createTestPill('pill-1', 'New Pill');
+    
+    // Marking a pill dirty should create an outbox entry
+    markPillDirty(userId, pill, 'upsert');
+    
+    const outbox = loadOutboxFromStorage(userId);
+    expect(outbox.length).toBe(1);
+    expect(outbox[0].id).toBe('pill-1');
+    expect(outbox[0].type).toBe('upsert');
+  });
+  
+  it('FAILS if hasUnsyncedChanges does not detect outbox', () => {
+    const pill = createTestPill('pill-1', 'Test');
+    markPillDirty(userId, pill, 'upsert');
+    
+    // hasUnsyncedChanges should return true when outbox has entries
+    expect(hasUnsyncedChanges(userId)).toBe(true);
+    
+    // After clearing, should return false
+    clearUserData(userId);
+    expect(hasUnsyncedChanges(userId)).toBe(false);
+  });
+});

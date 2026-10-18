@@ -16,6 +16,7 @@ export const loadPillsFromCloud = async (): Promise<Pill[]> => {
   return (data || []).map(row => ({
     ...row.pill_data,
     id: row.id,
-    updatedAt: row.updated_at ? new Date(row.updated_at).getTime() : undefined,
+    // Use client updatedAt from pill_data, not server's updated_at (avoids clock skew)
+    updatedAt: row.pill_data?.updatedAt ?? (row.updated_at ? new Date(row.updated_at).getTime() : undefined),
   }));
 };

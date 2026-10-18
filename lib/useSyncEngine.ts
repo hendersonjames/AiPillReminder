@@ -48,6 +48,7 @@ export interface SyncEngineActions {
   markDirty: (pill: Pill, type: 'upsert' | 'delete') => Pill;
   queueTap: (pillId: string, reminderId: string) => void;
   applyTakenMark: (pillId: string, reminderId: string) => void;
+  markReminderTaken: (pillId: string, reminderId: string) => void;
   flushSync: () => Promise<FlushResult>;
   hasUnsynced: () => boolean;
   setPills: React.Dispatch<React.SetStateAction<Pill[]>>;
@@ -113,6 +114,16 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
       return pill;
     }));
   }, [userId, setPills]);
+  
+  const markReminderTaken = useCallback((pillId: string, reminderId: string) => {
+    if (shouldQueueTap(cloudLoadSucceededRef.current)) {
+      const tap = { pillId, reminderId, userId };
+      pendingTapsRef.current.push(tap);
+      addQueuedTap(userId, tap);
+      return;
+    }
+    applyTakenMark(pillId, reminderId);
+  }, [userId, applyTakenMark]);
   
   const flushSync = useCallback(async (): Promise<FlushResult> => {
     if (!cloudLoadSucceededRef.current) {
@@ -204,13 +215,19 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
         clearQueuedTaps(userId);
         
         const enhancedPills = enhancePillsWithDerivedStatus(orchestrationResult.pills);
-        setPills(enhancedPills);
         savePillsToStorage(userId, enhancedPills);
         
-        // Flush outbox after load
+        // Flush outbox after load - set flag BEFORE setPills to prevent debounced effect
         const currentOutbox = loadOutboxFromStorage(userId);
         if (currentOutbox.length > 0 || hasLocalChanges) {
           justFlushedRef.current = true;
+        }
+        
+        // Now update state (triggers debounced effect, but justFlushedRef is already set)
+        setPills(enhancedPills);
+        
+        // Actually flush
+        if (currentOutbox.length > 0 || hasLocalChanges) {
           const flushResult = await flushOutbox(userId);
           if (flushResult.success) {
             setSyncStatus('synced');
@@ -284,6 +301,7 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
       markDirty,
       queueTap,
       applyTakenMark,
+      markReminderTaken,
       flushSync,
       hasUnsynced,
       setPills,
