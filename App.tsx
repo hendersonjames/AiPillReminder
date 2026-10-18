@@ -29,11 +29,9 @@ import {
   purgeLegacyUnscopedData,
 } from './lib/storage';
 import {
-  initBroadcastChannel,
   broadcastPillChange,
   broadcastPillsLoaded,
   hasUnsyncedChanges,
-  type SyncMessage,
 } from './lib/syncEngine';
 import { useSyncEngine } from './lib/useSyncEngine';
 import {
@@ -248,11 +246,16 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   onClearError,
 }) => {
   const [notifDismissed, setNotifDismissed] = useState(false);
+  const [idGenError, setIdGenError] = useState<string | null>(null);
+  
+  // Track if last reload was triggered by BroadcastChannel (prevents ping-pong)
+  const reloadTriggeredByChannelRef = useRef(false);
   
   // ─── Use sync engine hook for core sync wiring ──────────────────────────────
   const { state, actions } = useSyncEngine({
     userId,
     loadPillsFromCloud,
+    signingOut: signingOutRef.current,
     onPillsChange: (newPills) => {
       // Reschedule notifications when pills change
       if (isNative()) {
@@ -260,8 +263,11 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
           scheduleAllPillNotifications(newPills);
         });
       }
-      // Broadcast to other tabs
-      broadcastPillsLoaded(userId);
+      // Broadcast to other tabs ONLY if not triggered by channel message
+      if (!reloadTriggeredByChannelRef.current) {
+        broadcastPillsLoaded(userId);
+      }
+      reloadTriggeredByChannelRef.current = false;
     },
   });
   
@@ -307,8 +313,17 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
 
   // ─── Multi-tab coordination via BroadcastChannel ────────────────────────────
   useEffect(() => {
-    const handleSyncMessage = (msg: SyncMessage) => {
+    if (typeof BroadcastChannel === 'undefined') return;
+    
+    const channel = new BroadcastChannel(`remedi_sync_${userId}`);
+    
+    channel.onmessage = (event) => {
+      const msg = event.data;
+      if (!msg || typeof msg !== 'object') return;
       if (msg.userId !== userId) return;
+      
+      // Mark that reload is triggered by channel to prevent ping-pong
+      reloadTriggeredByChannelRef.current = true;
       
       if (msg.type === 'pill_changed' && msg.pillId) {
         const refreshedPills = loadPillsFromStorage(userId);
@@ -321,9 +336,10 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       }
     };
     
-    const cleanup = initBroadcastChannel(userId, handleSyncMessage);
-    return cleanup;
-  }, [userId, setPills]);
+    return () => {
+      channel.close();
+    };
+  }, [userId]); // Only depends on userId
 
   // ─── Flush pending sync wrapper for sign-out ────────────────────────────────
   const flushPendingSync = useCallback(async (): Promise<boolean> => {
@@ -508,17 +524,22 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       const now = Date.now();
       // Use crypto.randomUUID() with crypto.getRandomValues fallback
       let newId: string;
-      if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-        newId = crypto.randomUUID();
-      } else if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-        const bytes = new Uint8Array(16);
-        crypto.getRandomValues(bytes);
-        bytes[6] = (bytes[6] & 0x0f) | 0x40; // Version 4
-        bytes[8] = (bytes[8] & 0x3f) | 0x80; // Variant 10
-        const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-        newId = `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
-      } else {
-        throw new Error('crypto.randomUUID or crypto.getRandomValues required for pill ID generation');
+      try {
+        if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+          newId = crypto.randomUUID();
+        } else if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+          const bytes = new Uint8Array(16);
+          crypto.getRandomValues(bytes);
+          bytes[6] = (bytes[6] & 0x0f) | 0x40; // Version 4
+          bytes[8] = (bytes[8] & 0x3f) | 0x80; // Variant 10
+          const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+          newId = `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+        } else {
+          throw new Error('crypto.randomUUID or crypto.getRandomValues required for pill ID generation');
+        }
+      } catch (err) {
+        setIdGenError(err instanceof Error ? err.message : 'Failed to generate pill ID');
+        return;
       }
       savedPill = { ...pillData, id: newId, history: [], createdAt: now };
       savedPill.reminders = savedPill.reminders.map(r => ({
@@ -546,6 +567,7 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
     }
     setAddPillModalOpen(false);
     setPillToEdit(undefined);
+    setIdGenError(null);
   };
 
   const openAddModal = () => { setPillToEdit(undefined); setAddPillModalOpen(true); };
@@ -669,6 +691,14 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
           <div className="mb-3 p-3 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-800 flex items-start justify-between gap-2">
             <span>{signOutError}</span>
             <button onClick={onClearError} className="text-amber-400 hover:text-amber-600 flex-shrink-0">✕</button>
+          </div>
+        )}
+        
+        {/* ID generation error banner */}
+        {idGenError && (
+          <div className="mb-3 p-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-800 flex items-start justify-between gap-2">
+            <span>Failed to create pill: {idGenError}</span>
+            <button onClick={() => setIdGenError(null)} className="text-red-400 hover:text-red-600 flex-shrink-0">✕</button>
           </div>
         )}
 

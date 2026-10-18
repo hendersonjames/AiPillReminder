@@ -67,8 +67,9 @@ export const mergePills = (
     }
 
     if (inOutbox && outboxEntry) {
-      const localTime = localPill.updatedAt ?? 0;
-      const cloudTime = cloudPill.updatedAt ?? 0;
+      // Treat non-finite updatedAt as 0 to handle NaN/undefined/Infinity
+      const localTime = Number.isFinite(localPill.updatedAt) ? localPill.updatedAt! : 0;
+      const cloudTime = Number.isFinite(cloudPill.updatedAt) ? cloudPill.updatedAt! : 0;
       if (localTime >= cloudTime) {
         merged.push(localPill);
       } else {

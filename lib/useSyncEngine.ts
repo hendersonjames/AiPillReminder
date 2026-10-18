@@ -2,7 +2,7 @@
 // Custom hook that encapsulates sync wiring for testability.
 // App.tsx uses this hook, and tests can verify the wiring works correctly.
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Pill } from '../types';
 import type { QueuedTap } from './loadOrchestration';
 import {
@@ -34,6 +34,7 @@ import { recordMissedDoses, enhancePillsWithDerivedStatus } from './pillHelpers'
 export interface SyncEngineConfig {
   userId: string;
   loadPillsFromCloud: () => Promise<Pill[]>;
+  signingOut?: boolean;
   onPillsChange?: (pills: Pill[]) => void;
   onSyncStatusChange?: (status: 'idle' | 'syncing' | 'synced' | 'error') => void;
 }
@@ -51,7 +52,7 @@ export interface SyncEngineActions {
   markReminderTaken: (pillId: string, reminderId: string) => void;
   flushSync: () => Promise<FlushResult>;
   hasUnsynced: () => boolean;
-  setPills: React.Dispatch<React.SetStateAction<Pill[]>>;
+  setPills: (action: Pill[] | ((prev: Pill[]) => Pill[])) => void;
 }
 
 export interface UseSyncEngineResult {
@@ -60,7 +61,7 @@ export interface UseSyncEngineResult {
 }
 
 export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => {
-  const { userId, loadPillsFromCloud, onPillsChange, onSyncStatusChange } = config;
+  const { userId, loadPillsFromCloud, signingOut = false } = config;
   
   const [pills, setPillsInternal] = useState<Pill[]>([]);
   const [syncStatus, setSyncStatusInternal] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
@@ -70,24 +71,38 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
   const pendingTapsRef = useRef<QueuedTap[]>([]);
   const justFlushedRef = useRef(false);
   const pillsRef = useRef<Pill[]>([]);
+  const loadPillsFromCloudRef = useRef(loadPillsFromCloud);
+  const signingOutRef = useRef(signingOut);
   
-  // Keep ref in sync
-  useEffect(() => { pillsRef.current = pills; }, [pills]);
+  // Keep refs in sync
+  useEffect(() => { loadPillsFromCloudRef.current = loadPillsFromCloud; }, [loadPillsFromCloud]);
+  useEffect(() => { signingOutRef.current = signingOut; }, [signingOut]);
   
-  // Wrapper to notify on pills change
-  const setPills: React.Dispatch<React.SetStateAction<Pill[]>> = useCallback((action) => {
+  // Store callbacks in refs to avoid effect re-runs
+  const onPillsChangeRef = useRef(config.onPillsChange);
+  const onSyncStatusChangeRef = useRef(config.onSyncStatusChange);
+  useEffect(() => { onPillsChangeRef.current = config.onPillsChange; }, [config.onPillsChange]);
+  useEffect(() => { onSyncStatusChangeRef.current = config.onSyncStatusChange; }, [config.onSyncStatusChange]);
+  
+  // Stable setPills that doesn't change identity
+  const setPills = useCallback((action: Pill[] | ((prev: Pill[]) => Pill[])) => {
     setPillsInternal(prev => {
       const next = typeof action === 'function' ? action(prev) : action;
-      onPillsChange?.(next);
       return next;
     });
-  }, [onPillsChange]);
+  }, []);
   
-  // Wrapper to notify on sync status change
+  // Stable setSyncStatus
   const setSyncStatus = useCallback((status: 'idle' | 'syncing' | 'synced' | 'error') => {
     setSyncStatusInternal(status);
-    onSyncStatusChange?.(status);
-  }, [onSyncStatusChange]);
+    onSyncStatusChangeRef.current?.(status);
+  }, []);
+  
+  // Call onPillsChange when pills change (via separate effect, not in state updater)
+  useEffect(() => {
+    pillsRef.current = pills;
+    onPillsChangeRef.current?.(pills);
+  }, [pills]);
   
   // ─── Core Actions ─────────────────────────────────────────────────────────────
   
@@ -135,17 +150,13 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
     
     const result = await flushOutbox(userId);
     
-    // Handle tombstoned pills
-    if (result.tombstonedIds && result.tombstonedIds.length > 0) {
-      setPills(prev => prev.filter(p => !result.tombstonedIds!.includes(p.id)));
-    }
-    
+    // Handle tombstoned pills - do NOT call setPills, return ids for caller
     if (result.success) {
       setPendingSync(userId, false);
     }
     
     return result;
-  }, [userId, setPills]);
+  }, [userId]);
   
   const hasUnsynced = useCallback((): boolean => {
     return hasUnsyncedChanges(userId);
@@ -153,6 +164,8 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
   
   // ─── Load from cloud on mount ─────────────────────────────────────────────────
   useEffect(() => {
+    let cancelled = false;
+    
     const loadCloud = async () => {
       cloudLoadSucceededRef.current = false;
       loadedForUserIdRef.current = null;
@@ -163,13 +176,15 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
       
       // Load local pills for immediate UI
       const localPills = loadPillsFromStorage(userId);
-      if (localPills.length > 0) {
-        setPills(enhancePillsWithDerivedStatus(localPills));
+      if (localPills.length > 0 && !cancelled) {
+        setPillsInternal(enhancePillsWithDerivedStatus(localPills));
       }
       
       try {
-        setSyncStatus('syncing');
-        const cloudPills = await loadPillsFromCloud();
+        setSyncStatusInternal('syncing');
+        const cloudPills = await loadPillsFromCloudRef.current();
+        
+        if (cancelled) return;
         
         // MERGE cloud with local dirty changes
         const outbox = loadOutboxFromStorage(userId);
@@ -223,34 +238,37 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
           justFlushedRef.current = true;
         }
         
-        // Now update state (triggers debounced effect, but justFlushedRef is already set)
-        setPills(enhancedPills);
+        if (cancelled) return;
+        
+        // Now update state
+        setPillsInternal(enhancedPills);
         
         // Actually flush
         if (currentOutbox.length > 0 || hasLocalChanges) {
           const flushResult = await flushOutbox(userId);
-          if (flushResult.success) {
-            setSyncStatus('synced');
-          } else {
-            setSyncStatus('error');
+          if (!cancelled) {
+            setSyncStatusInternal(flushResult.success ? 'synced' : 'error');
           }
         } else {
-          setSyncStatus('synced');
+          if (!cancelled) setSyncStatusInternal('synced');
         }
         
         setPendingSync(userId, false);
       } catch (err) {
         console.error('Failed to load from cloud:', err);
-        setSyncStatus('error');
+        if (!cancelled) setSyncStatusInternal('error');
       }
     };
     
     loadCloud();
-  }, [userId, loadPillsFromCloud, setPills, setSyncStatus]);
+    
+    return () => { cancelled = true; };
+  }, [userId]); // Only depends on userId
   
   // ─── Persist to localStorage ──────────────────────────────────────────────────
   useEffect(() => {
     if (loadedForUserIdRef.current !== userId) return;
+    if (signingOutRef.current) return; // Block writes during sign-out
     savePillsToStorage(userId, pills);
   }, [pills, userId]);
   
@@ -258,6 +276,7 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
   useEffect(() => {
     if (!cloudLoadSucceededRef.current) return;
     if (loadedForUserIdRef.current !== userId) return;
+    if (signingOutRef.current) return;
     
     if (justFlushedRef.current) {
       justFlushedRef.current = false;
@@ -268,28 +287,29 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
     if (outbox.length === 0) return;
     
     setPendingSync(userId, true);
-    setSyncStatus('idle');
+    setSyncStatusInternal('idle');
     
     const timeoutId = setTimeout(async () => {
       if (loadedForUserIdRef.current !== userId) return;
+      if (signingOutRef.current) return;
       
-      setSyncStatus('syncing');
+      setSyncStatusInternal('syncing');
       const result = await flushOutbox(userId);
       
       if (result.tombstonedIds && result.tombstonedIds.length > 0) {
-        setPills(prev => prev.filter(p => !result.tombstonedIds!.includes(p.id)));
+        setPillsInternal(prev => prev.filter(p => !result.tombstonedIds!.includes(p.id)));
       }
       
       if (result.success) {
         setPendingSync(userId, false);
-        setSyncStatus('synced');
+        setSyncStatusInternal('synced');
       } else {
-        setSyncStatus('error');
+        setSyncStatusInternal('error');
       }
     }, 1500);
     
     return () => clearTimeout(timeoutId);
-  }, [pills, userId, setPills, setSyncStatus]);
+  }, [pills, userId]); // Stable deps - no function deps
   
   return {
     state: {

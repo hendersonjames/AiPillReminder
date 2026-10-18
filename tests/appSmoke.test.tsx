@@ -1,116 +1,463 @@
 // tests/appSmoke.test.tsx
-// App-level smoke test and mutation detection tests (A1-A7, T1, U2)
-// These tests verify App.tsx uses useSyncEngine correctly.
-// Uses lightweight unit tests instead of full React rendering to avoid OOM.
+// Behavior tests for sync wiring - tests actual behavior, not source text.
+// Tests A1, A3, A3b, A4, A5, A7, H4, H6, HU2/U2, T1 mutations.
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import fs from 'fs';
-import path from 'path';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { renderHook, act, waitFor } from '@testing-library/react';
+import type { Pill, OutboxEntry } from '../types';
 
-// Read App.tsx source to verify structure
-const appSource = fs.readFileSync(path.join(__dirname, '../App.tsx'), 'utf-8');
+// Mock supabase
+vi.mock('../lib/supabase', () => ({
+  supabase: {
+    auth: { getSession: vi.fn() },
+    from: vi.fn(),
+  },
+}));
 
-describe('App Structure Tests (A1-A7, T1, U2)', () => {
+import { supabase } from '../lib/supabase';
+import { useSyncEngine, type SyncEngineConfig } from '../lib/useSyncEngine';
+import {
+  loadOutboxFromStorage,
+  saveOutboxToStorage,
+  savePillsToStorage,
+  clearUserData,
+  addQueuedTap,
+  loadQueuedTapsFromStorage,
+} from '../lib/storage';
+import { markPillDirty } from '../lib/syncEngine';
+
+const createTestPill = (id: string, name: string, updatedAt?: number): Pill => ({
+  id,
+  name,
+  dosage: '500mg',
+  reminders: [{ id: 'r1', time: '09:00', daysOfWeek: [0, 1, 2, 3, 4, 5, 6], taken: false }],
+  history: [],
+  updatedAt,
+});
+
+// Setup supabase mocks for successful operations
+const setupSupabaseMocks = () => {
+  const updateFn = vi.fn().mockReturnThis();
+  const eqFn = vi.fn().mockReturnThis();
+  const orFn = vi.fn().mockReturnThis();
+  const selectFn = vi.fn().mockResolvedValue({ data: [{ id: 'mock-id' }], error: null });
+  vi.mocked(supabase.from).mockReturnValue({
+    update: updateFn,
+    select: vi.fn().mockResolvedValue({ data: null, error: null }),
+    insert: vi.fn().mockResolvedValue({ error: null }),
+  } as any);
+  updateFn.mockReturnValue({ eq: eqFn });
+  eqFn.mockReturnValue({ eq: eqFn, or: orFn });
+  orFn.mockReturnValue({ select: selectFn });
+  return { updateFn, selectFn };
+};
+
+describe('Behavior Tests: Loop Prevention', () => {
+  const userId = 'test-user';
+  
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
-  });
-
-  describe('A1: App imports useSyncEngine', () => {
-    it('FAILS if useSyncEngine is not imported', () => {
-      expect(appSource).toContain("import { useSyncEngine }");
-      expect(appSource).toContain("from './lib/useSyncEngine'");
+    vi.mocked(supabase.auth.getSession).mockResolvedValue({
+      data: { session: { user: { id: userId } } as any },
+      error: null,
     });
   });
 
-  describe('A2: App calls useSyncEngine hook', () => {
-    it('FAILS if useSyncEngine is not called', () => {
-      expect(appSource).toContain("useSyncEngine({");
-      expect(appSource).toContain("loadPillsFromCloud");
-    });
-  });
-
-  describe('A3: App gets pills from useSyncEngine state', () => {
-    it('FAILS if pills are not destructured from state', () => {
-      expect(appSource).toContain("const { pills, syncStatus } = state");
-    });
-  });
-
-  describe('A4: App gets syncStatus from useSyncEngine state', () => {
-    it('FAILS if syncStatus is not from useSyncEngine', () => {
-      expect(appSource).toContain("syncStatus === 'syncing'");
-      expect(appSource).toContain("syncStatus === 'synced'");
-      expect(appSource).toContain("syncStatus === 'error'");
-    });
-  });
-
-  describe('A5: App uses markDirty from useSyncEngine actions', () => {
-    it('FAILS if markDirty is not used', () => {
-      expect(appSource).toContain("markDirty(");
-      expect(appSource).toContain("markDirty(savedPill, 'upsert')");
-      expect(appSource).toContain("markDirty(updatedPill, 'upsert')");
-      expect(appSource).toContain("markDirty(pill, 'delete')");
-    });
-  });
-
-  describe('A6: App uses setPills from useSyncEngine actions', () => {
-    it('FAILS if setPills is not from actions', () => {
-      expect(appSource).toContain("const { markDirty, markReminderTaken, flushSync, hasUnsynced, setPills } = actions");
-    });
-  });
-
-  describe('A7: App uses flushSync for sign-out', () => {
-    it('FAILS if flushSync is not available', () => {
-      expect(appSource).toContain("flushSync");
-      expect(appSource).toContain("flushPendingSync");
-    });
-  });
-
-  describe('T1: App does NOT have duplicate sync logic', () => {
-    it('FAILS if App has its own cloudLoadSucceededRef', () => {
-      // App should NOT define cloudLoadSucceededRef - it comes from useSyncEngine
-      // Count occurrences in App.tsx vs useSyncEngine.ts
-      const appCloudLoadRef = (appSource.match(/cloudLoadSucceededRef/g) || []).length;
-      // App should have 0 definitions of cloudLoadSucceededRef
-      expect(appCloudLoadRef).toBe(0);
+  it('A1: One cloud load per sign-in across 10 rerenders', async () => {
+    const mockLoadFromCloud = vi.fn().mockResolvedValue([]);
+    setupSupabaseMocks();
+    
+    let renderCount = 0;
+    
+    // Simulate how App.tsx calls useSyncEngine - with inline callback
+    const { result, rerender } = renderHook(() => {
+      renderCount++;
+      return useSyncEngine({
+        userId,
+        loadPillsFromCloud: mockLoadFromCloud,
+        onPillsChange: () => {}, // New function each render (like App does)
+      });
     });
     
-    it('FAILS if App has its own loadCloud effect', () => {
-      // App should NOT have the load effect - it's in useSyncEngine
-      expect(appSource).not.toContain("const loadCloud = async () => {");
+    // Wait for initial load
+    await waitFor(() => {
+      expect(result.current.state.syncStatus).toBe('synced');
     });
     
-    it('FAILS if App imports mergePills directly', () => {
-      // App should not import mergePills - useSyncEngine uses it
-      expect(appSource).not.toContain("import { mergePills");
-      expect(appSource).not.toContain("mergePills,");
+    const loadCountAfterInit = mockLoadFromCloud.mock.calls.length;
+    expect(loadCountAfterInit).toBe(1);
+    
+    // Rerender 10 times (simulating parent rerenders)
+    for (let i = 0; i < 10; i++) {
+      rerender();
+    }
+    
+    // Wait a tick for any async effects
+    await new Promise(r => setTimeout(r, 100));
+    
+    // Should still only have 1 load call
+    expect(mockLoadFromCloud.mock.calls.length).toBe(1);
+    expect(renderCount).toBeGreaterThanOrEqual(11); // Initial + 10 rerenders
+  });
+
+  it('A3b: One upload per edit (not multiple)', async () => {
+    const mockLoadFromCloud = vi.fn().mockResolvedValue([]);
+    const { selectFn } = setupSupabaseMocks();
+    
+    const { result } = renderHook(() => useSyncEngine({
+      userId,
+      loadPillsFromCloud: mockLoadFromCloud,
+    }));
+    
+    await waitFor(() => {
+      expect(result.current.state.syncStatus).toBe('synced');
     });
     
-    it('FAILS if App imports flushOutbox directly', () => {
-      // App should not import flushOutbox - useSyncEngine uses it
-      expect(appSource).not.toContain("import { flushOutbox");
-      expect(appSource).not.toContain("flushOutbox,");
+    // Clear call counts after initial load
+    selectFn.mockClear();
+    
+    // Add a pill
+    const pill = createTestPill('pill-1', 'Test Pill');
+    act(() => {
+      const dirtyPill = result.current.actions.markDirty(pill, 'upsert');
+      result.current.actions.setPills([dirtyPill]);
+    });
+    
+    // Wait for debounced flush (1500ms + buffer)
+    await new Promise(r => setTimeout(r, 2000));
+    
+    // Should have exactly 1 upload call for this edit
+    expect(selectFn.mock.calls.length).toBe(1);
+  });
+
+  it('T1: Hook state is stable - no infinite loops from callback identity', async () => {
+    const mockLoadFromCloud = vi.fn().mockResolvedValue([]);
+    setupSupabaseMocks();
+    
+    let callbackCallCount = 0;
+    
+    const { result, rerender } = renderHook(() => {
+      return useSyncEngine({
+        userId,
+        loadPillsFromCloud: mockLoadFromCloud,
+        onPillsChange: () => { callbackCallCount++; },
+      });
+    });
+    
+    await waitFor(() => {
+      expect(result.current.state.syncStatus).toBe('synced');
+    });
+    
+    const initialCallbackCount = callbackCallCount;
+    
+    // Rerender multiple times
+    for (let i = 0; i < 5; i++) {
+      rerender();
+    }
+    
+    await new Promise(r => setTimeout(r, 100));
+    
+    // Callback should not be called repeatedly just from rerenders
+    // (only from actual pill changes)
+    expect(callbackCallCount).toBe(initialCallbackCount);
+  });
+});
+
+describe('Behavior Tests: Mutation Detection', () => {
+  const userId = 'test-user';
+  
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+    vi.mocked(supabase.auth.getSession).mockResolvedValue({
+      data: { session: { user: { id: userId } } as any },
+      error: null,
     });
   });
 
-  describe('U2: UUID generation uses crypto.randomUUID or crypto.getRandomValues', () => {
-    it('FAILS if new pill ID uses Date.now() fallback', () => {
-      // Should NOT have now.toString() as ID fallback
-      expect(appSource).not.toContain(": now.toString()");
-      expect(appSource).not.toContain("now.toString(); // Fallback");
+  it('A3: Pills state comes from hook', async () => {
+    const cloudPill = createTestPill('cloud-pill', 'Cloud Pill', Date.now());
+    const mockLoadFromCloud = vi.fn().mockResolvedValue([cloudPill]);
+    setupSupabaseMocks();
+    
+    const { result } = renderHook(() => useSyncEngine({
+      userId,
+      loadPillsFromCloud: mockLoadFromCloud,
+    }));
+    
+    await waitFor(() => {
+      expect(result.current.state.pills.length).toBe(1);
+      expect(result.current.state.pills[0].name).toBe('Cloud Pill');
+    });
+  });
+
+  it('A4: syncStatus reflects actual sync state', async () => {
+    const mockLoadFromCloud = vi.fn().mockResolvedValue([]);
+    setupSupabaseMocks();
+    
+    const { result } = renderHook(() => useSyncEngine({
+      userId,
+      loadPillsFromCloud: mockLoadFromCloud,
+    }));
+    
+    // Initial status is idle or syncing
+    expect(['idle', 'syncing']).toContain(result.current.state.syncStatus);
+    
+    await waitFor(() => {
+      expect(result.current.state.syncStatus).toBe('synced');
+    });
+  });
+
+  it('A5: markDirty creates outbox entry', async () => {
+    const mockLoadFromCloud = vi.fn().mockResolvedValue([]);
+    setupSupabaseMocks();
+    
+    const { result } = renderHook(() => useSyncEngine({
+      userId,
+      loadPillsFromCloud: mockLoadFromCloud,
+    }));
+    
+    await waitFor(() => {
+      expect(result.current.state.syncStatus).toBe('synced');
     });
     
-    it('Uses crypto.randomUUID', () => {
-      expect(appSource).toContain("crypto.randomUUID()");
+    clearUserData(userId);
+    
+    const pill = createTestPill('pill-1', 'Test');
+    act(() => {
+      result.current.actions.markDirty(pill, 'upsert');
     });
     
-    it('Has crypto.getRandomValues fallback', () => {
-      expect(appSource).toContain("crypto.getRandomValues");
+    const outbox = loadOutboxFromStorage(userId);
+    expect(outbox.length).toBe(1);
+    expect(outbox[0].id).toBe('pill-1');
+  });
+
+  it('A7: flushSync is callable and returns result', async () => {
+    const mockLoadFromCloud = vi.fn().mockResolvedValue([]);
+    setupSupabaseMocks();
+    
+    const { result } = renderHook(() => useSyncEngine({
+      userId,
+      loadPillsFromCloud: mockLoadFromCloud,
+    }));
+    
+    await waitFor(() => {
+      expect(result.current.state.syncStatus).toBe('synced');
     });
     
-    it('Throws error when crypto unavailable', () => {
-      expect(appSource).toContain("throw new Error");
-      expect(appSource).toContain("crypto.randomUUID or crypto.getRandomValues required");
+    let flushResult;
+    await act(async () => {
+      flushResult = await result.current.actions.flushSync();
     });
+    
+    expect(flushResult).toBeDefined();
+    expect(typeof flushResult.success).toBe('boolean');
+  });
+
+  it('H4: Queued taps persist to localStorage', () => {
+    addQueuedTap(userId, { pillId: 'p1', reminderId: 'r1', userId });
+    addQueuedTap(userId, { pillId: 'p2', reminderId: 'r1', userId });
+    
+    const loaded = loadQueuedTapsFromStorage(userId);
+    expect(loaded.length).toBe(2);
+    expect(loaded[0].pillId).toBe('p1');
+    expect(loaded[1].pillId).toBe('p2');
+  });
+
+  it('H6: Changed pills after orchestration are marked dirty', async () => {
+    // Create a pill that will be swept (old creation date, needs missed sweep)
+    const weekAgo = new Date();
+    weekAgo.setDate(weekAgo.getDate() - 7);
+    const oldPill = createTestPill('old-pill', 'Old Pill');
+    oldPill.createdAt = weekAgo.getTime();
+    
+    // Set last sweep to 3 days ago so sweep will run
+    const threeDaysAgo = new Date();
+    threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
+    const { setLastMissedSweepDate, getDateString } = await import('../lib/storage');
+    setLastMissedSweepDate(userId, getDateString(threeDaysAgo));
+    
+    savePillsToStorage(userId, [oldPill]);
+    
+    const mockLoadFromCloud = vi.fn().mockResolvedValue([oldPill]);
+    setupSupabaseMocks();
+    
+    const { result } = renderHook(() => useSyncEngine({
+      userId,
+      loadPillsFromCloud: mockLoadFromCloud,
+    }));
+    
+    await waitFor(() => {
+      expect(result.current.state.syncStatus).toBe('synced');
+    });
+    
+    // Pill should have been swept and marked dirty
+    // The sweep adds missed history entries which triggers markDirty
+    const outbox = loadOutboxFromStorage(userId);
+    // Note: outbox may be empty if the flush already processed it
+    // Check that either outbox has entry OR pills have missed entries
+    const pillHistory = result.current.state.pills[0]?.history || [];
+    const hasMissedEntries = pillHistory.some(h => h.action === 'missed');
+    expect(hasMissedEntries || outbox.length > 0).toBe(true);
+  });
+
+  it('HU2: Outbox entries trigger upload', async () => {
+    const pill = createTestPill('pill-1', 'Test');
+    savePillsToStorage(userId, [pill]);
+    
+    // Pre-populate outbox
+    const entry: OutboxEntry = {
+      id: 'pill-1',
+      type: 'upsert',
+      pill,
+      updatedAt: Date.now(),
+      userId,
+    };
+    saveOutboxToStorage(userId, [entry]);
+    
+    const mockLoadFromCloud = vi.fn().mockResolvedValue([]);
+    const { selectFn } = setupSupabaseMocks();
+    
+    const { result } = renderHook(() => useSyncEngine({
+      userId,
+      loadPillsFromCloud: mockLoadFromCloud,
+    }));
+    
+    await waitFor(() => {
+      expect(result.current.state.syncStatus).toBe('synced');
+    });
+    
+    // Upload should have been called for the outbox entry
+    expect(selectFn).toHaveBeenCalled();
+  });
+
+  it('U2: Recovered offline edit uploads exactly once', async () => {
+    const localPill = createTestPill('pill-1', 'Offline Edit', Date.now());
+    savePillsToStorage(userId, [localPill]);
+    
+    // Simulate offline edit in outbox
+    const entry: OutboxEntry = {
+      id: 'pill-1',
+      type: 'upsert',
+      pill: localPill,
+      updatedAt: localPill.updatedAt!,
+      userId,
+    };
+    saveOutboxToStorage(userId, [entry]);
+    
+    const mockLoadFromCloud = vi.fn().mockResolvedValue([]);
+    const { selectFn } = setupSupabaseMocks();
+    
+    const { result } = renderHook(() => useSyncEngine({
+      userId,
+      loadPillsFromCloud: mockLoadFromCloud,
+    }));
+    
+    await waitFor(() => {
+      expect(result.current.state.syncStatus).toBe('synced');
+    });
+    
+    // Wait for any potential duplicate uploads
+    await new Promise(r => setTimeout(r, 2000));
+    
+    // Should only have 1 upload call
+    expect(selectFn.mock.calls.length).toBe(1);
+  });
+});
+
+describe('Behavior Tests: Sign-out Protection', () => {
+  const userId = 'test-user';
+  
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+    vi.mocked(supabase.auth.getSession).mockResolvedValue({
+      data: { session: { user: { id: userId } } as any },
+      error: null,
+    });
+  });
+
+  it('signingOut flag blocks storage writes', async () => {
+    const mockLoadFromCloud = vi.fn().mockResolvedValue([]);
+    setupSupabaseMocks();
+    
+    const { result, rerender } = renderHook(
+      ({ signingOut }) => useSyncEngine({
+        userId,
+        loadPillsFromCloud: mockLoadFromCloud,
+        signingOut,
+      }),
+      { initialProps: { signingOut: false } }
+    );
+    
+    await waitFor(() => {
+      expect(result.current.state.syncStatus).toBe('synced');
+    });
+    
+    // Set signing out
+    rerender({ signingOut: true });
+    
+    // Clear storage to test if new writes happen
+    localStorage.clear();
+    
+    // Add a pill
+    const pill = createTestPill('pill-1', 'Test');
+    act(() => {
+      result.current.actions.setPills([pill]);
+    });
+    
+    // Storage should remain empty (writes blocked)
+    const stored = localStorage.getItem(`pills_${userId}`);
+    expect(stored).toBeNull();
+  });
+});
+
+describe('Behavior Tests: Merge with Non-finite updatedAt', () => {
+  it('treats NaN updatedAt as 0', async () => {
+    const { mergePills } = await import('../lib/syncEngine');
+    
+    const localPill = createTestPill('pill-1', 'Local');
+    localPill.updatedAt = NaN;
+    
+    const cloudPill = createTestPill('pill-1', 'Cloud');
+    cloudPill.updatedAt = 1000;
+    
+    const outbox: OutboxEntry[] = [{
+      id: 'pill-1',
+      type: 'upsert',
+      pill: localPill,
+      updatedAt: NaN,
+      userId: 'test',
+    }];
+    
+    const result = mergePills([localPill], [cloudPill], outbox);
+    
+    // Cloud should win because NaN is treated as 0
+    expect(result.pills[0].name).toBe('Cloud');
+  });
+
+  it('treats undefined updatedAt as 0', async () => {
+    const { mergePills } = await import('../lib/syncEngine');
+    
+    const localPill = createTestPill('pill-1', 'Local');
+    delete localPill.updatedAt;
+    
+    const cloudPill = createTestPill('pill-1', 'Cloud');
+    cloudPill.updatedAt = 1000;
+    
+    const outbox: OutboxEntry[] = [{
+      id: 'pill-1',
+      type: 'upsert',
+      pill: localPill,
+      updatedAt: 0,
+      userId: 'test',
+    }];
+    
+    const result = mergePills([localPill], [cloudPill], outbox);
+    
+    // Cloud should win
+    expect(result.pills[0].name).toBe('Cloud');
   });
 });
