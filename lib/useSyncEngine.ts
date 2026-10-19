@@ -22,6 +22,7 @@ import {
   markPillDirty,
   flushOutbox,
   hasUnsyncedChanges,
+  withFlushLock,
   type FlushResult,
 } from './syncEngine';
 import {
@@ -149,9 +150,25 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
       return { success: false, error: 'User mismatch' };
     }
     
-    const result = await flushOutbox(userId);
+    // Use Web Locks to ensure only one tab flushes at a time
+    const { acquired, result } = await withFlushLock(userId, async () => {
+      const currentOutbox = loadOutboxFromStorage(userId);
+      if (currentOutbox.length === 0) {
+        return { success: true } as FlushResult;
+      }
+      return await flushOutbox(userId);
+    });
     
-    // Handle tombstoned pills - do NOT call setPills, return ids for caller
+    if (!acquired || !result) {
+      // Another tab is flushing
+      return { success: true };
+    }
+    
+    // L-b fix: remove tombstoned pills from state
+    if (result.tombstonedIds && result.tombstonedIds.length > 0) {
+      setPillsInternal(prev => prev.filter(p => !result.tombstonedIds!.includes(p.id)));
+    }
+    
     if (result.success) {
       setPendingSync(userId, false);
     }
@@ -164,10 +181,17 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
   }, [userId]);
   
   // ─── Load from cloud on mount ─────────────────────────────────────────────────
+  // Track if load is in progress to prevent duplicate loads (StrictMode, etc.)
+  const loadInProgressRef = useRef(false);
+  
   useEffect(() => {
     let cancelled = false;
     
     const loadCloud = async () => {
+      // Prevent duplicate loads
+      if (loadInProgressRef.current) return;
+      loadInProgressRef.current = true;
+      
       cloudLoadSucceededRef.current = false;
       loadedForUserIdRef.current = null;
       
@@ -255,9 +279,11 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
         }
         
         setPendingSync(userId, false);
+        loadInProgressRef.current = false;
       } catch (err) {
         console.error('Failed to load from cloud:', err);
         if (!cancelled) setSyncStatusInternal('error');
+        loadInProgressRef.current = false;
       }
     };
     
@@ -273,7 +299,7 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
     savePillsToStorage(userId, pills);
   }, [pills, userId]);
   
-  // ─── Debounced outbox flush ───────────────────────────────────────────────────
+  // ─── Debounced outbox flush (single-tab via Web Locks) ──────────────────────
   useEffect(() => {
     if (!cloudLoadSucceededRef.current) return;
     if (loadedForUserIdRef.current !== userId) return;
@@ -294,18 +320,36 @@ export const useSyncEngine = (config: SyncEngineConfig): UseSyncEngineResult => 
       if (loadedForUserIdRef.current !== userId) return;
       if (isSigningOut()) return; // N8: read live
       
-      setSyncStatusInternal('syncing');
-      const result = await flushOutbox(userId);
+      // Use Web Locks to ensure only one tab flushes at a time
+      const { acquired, result } = await withFlushLock(userId, async () => {
+        // Re-check outbox inside lock - another tab may have flushed
+        const currentOutbox = loadOutboxFromStorage(userId);
+        if (currentOutbox.length === 0) {
+          return { success: true } as FlushResult;
+        }
+        
+        setSyncStatusInternal('syncing');
+        return await flushOutbox(userId);
+      });
       
-      if (result.tombstonedIds && result.tombstonedIds.length > 0) {
-        setPillsInternal(prev => prev.filter(p => !result.tombstonedIds!.includes(p.id)));
+      if (!acquired) {
+        // Another tab is flushing - just wait and check status later
+        setSyncStatusInternal('idle');
+        return;
       }
       
-      if (result.success) {
-        setPendingSync(userId, false);
-        setSyncStatusInternal('synced');
-      } else {
-        setSyncStatusInternal('error');
+      if (result) {
+        // L-b fix: remove tombstoned pills from state
+        if (result.tombstonedIds && result.tombstonedIds.length > 0) {
+          setPillsInternal(prev => prev.filter(p => !result.tombstonedIds!.includes(p.id)));
+        }
+        
+        if (result.success) {
+          setPendingSync(userId, false);
+          setSyncStatusInternal('synced');
+        } else {
+          setSyncStatusInternal('error');
+        }
       }
     }, 1500);
     

@@ -255,19 +255,29 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   // Single BroadcastChannel instance owned by this component for both send & receive
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
   
+  // Debounce timer for notification rescheduling (L-a fix)
+  const notifRescheduleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  
   // ─── Use sync engine hook for core sync wiring ──────────────────────────────
   const { state, actions } = useSyncEngine({
     userId,
     loadPillsFromCloud,
     signingOutRef, // Pass ref directly for live reads (N8 fix)
     onPillsChange: (newPills) => {
-      // Reschedule notifications when pills change
+      // L-a fix: debounce notification rescheduling ~500ms
       if (isNative()) {
-        cancelAllScheduledNotifications().then(() => {
-          scheduleAllPillNotifications(newPills);
-        });
+        if (notifRescheduleTimerRef.current) {
+          clearTimeout(notifRescheduleTimerRef.current);
+        }
+        notifRescheduleTimerRef.current = setTimeout(() => {
+          cancelAllScheduledNotifications().then(() => {
+            scheduleAllPillNotifications(newPills);
+          });
+          notifRescheduleTimerRef.current = null;
+        }, 500);
       }
       // Broadcast to other tabs ONLY if not triggered by channel message
+      // Note: We send pills_loaded without pill data since storage is already written
       if (!reloadTriggeredByChannelRef.current && broadcastChannelRef.current) {
         broadcastChannelRef.current.postMessage(createSyncMessage('pills_loaded', userId));
       }
@@ -331,8 +341,21 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       if (msg.type === 'pill_changed' && msg.pillId) {
         // Set ping-pong flag BEFORE setPills to prevent re-broadcast
         reloadTriggeredByChannelRef.current = true;
-        const refreshedPills = loadPillsFromStorage(userId);
-        setPills(enhancePillsWithDerivedStatus(refreshedPills));
+        // Use pill from message if available (avoids race with storage)
+        if (msg.pill) {
+          setPills(prevPills => {
+            const exists = prevPills.some(p => p.id === msg.pillId);
+            if (exists) {
+              return prevPills.map(p => p.id === msg.pillId ? msg.pill! : p);
+            } else {
+              return [...prevPills, msg.pill!];
+            }
+          });
+        } else {
+          // Fallback to storage read
+          const refreshedPills = loadPillsFromStorage(userId);
+          setPills(enhancePillsWithDerivedStatus(refreshedPills));
+        }
       } else if (msg.type === 'pill_deleted' && msg.pillId) {
         reloadTriggeredByChannelRef.current = true;
         setPills(prevPills => prevPills.filter(p => p.id !== msg.pillId));
@@ -514,9 +537,9 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       
       setPills(prevPills => prevPills.map(p => (p.id === savedPill.id ? savedPill : p)));
       
-      // Broadcast change to other tabs (pillId only, no data)
+      // L-c fix: Broadcast AFTER save with full pill data (one message per change)
       if (broadcastChannelRef.current) {
-        broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, savedPill.id));
+        broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, savedPill.id, savedPill));
       }
       
       // Cancel old notifications and reschedule
@@ -562,9 +585,9 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       
       setPills(prevPills => [...prevPills, savedPill]);
       
-      // Broadcast change to other tabs (pillId only, no data)
+      // L-c fix: Broadcast AFTER save with full pill data (one message per change)
       if (broadcastChannelRef.current) {
-        broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, savedPill.id));
+        broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, savedPill.id, savedPill));
       }
       
       // Schedule notifications for new pill
@@ -635,9 +658,9 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
     // Update state
     setPills(prevPills => prevPills.map(p => p.id === pillId ? dirtyPill : p));
     
-    // Broadcast OUTSIDE the updater
+    // L-c fix: Broadcast AFTER save with full pill data (one message per change)
     if (broadcastChannelRef.current) {
-      broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, pillId));
+      broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, pillId, dirtyPill));
     }
   }, [userId, markDirty, setPills]);
 
@@ -677,9 +700,9 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
     // Update state
     setPills(prevPills => prevPills.map(p => p.id === pillId ? dirtyPill : p));
     
-    // Broadcast OUTSIDE the updater
+    // L-c fix: Broadcast AFTER save with full pill data (one message per change)
     if (broadcastChannelRef.current) {
-      broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, pillId));
+      broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, pillId, dirtyPill));
     }
   }, [userId, markDirty, setPills]);
 

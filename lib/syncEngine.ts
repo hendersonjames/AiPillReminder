@@ -9,8 +9,6 @@ import {
   saveOutboxToStorage,
   addToOutbox,
   removeFromOutbox,
-  loadPillsFromStorage,
-  savePillsToStorage,
 } from './storage';
 
 // ─── Conflict Resolution ──────────────────────────────────────────────────────
@@ -337,10 +335,11 @@ export const hasUnsyncedChanges = (userId: string): boolean => {
 // Per-user channel name to prevent cross-user message leakage
 export const getSyncChannelName = (userId: string): string => `remedi_sync_${userId}`;
 
-// Message shape: only pillId, no pill data (privacy + bandwidth)
+// Message includes full pill data so tab B doesn't read stale storage
 export interface SyncMessage {
   type: 'pill_changed' | 'pill_deleted' | 'pills_loaded';
   pillId?: string;
+  pill?: Pill; // Full pill data for immediate apply
   userId: string;
   timestamp: number;
 }
@@ -355,6 +354,8 @@ export const isValidSyncMessage = (data: unknown): data is SyncMessage => {
   if (typeof msg.userId !== 'string') return false;
   if (typeof msg.timestamp !== 'number') return false;
   if (msg.pillId !== undefined && typeof msg.pillId !== 'string') return false;
+  // pill is optional object
+  if (msg.pill !== undefined && (typeof msg.pill !== 'object' || msg.pill === null)) return false;
   
   return true;
 };
@@ -363,10 +364,58 @@ export const isValidSyncMessage = (data: unknown): data is SyncMessage => {
 export const createSyncMessage = (
   type: 'pill_changed' | 'pill_deleted' | 'pills_loaded',
   userId: string,
-  pillId?: string
+  pillId?: string,
+  pill?: Pill
 ): SyncMessage => ({
   type,
   pillId,
+  pill,
   userId,
   timestamp: Date.now(),
 });
+
+// ─── Web Locks for Single-Tab Flush ───────────────────────────────────────────
+
+// Lock name per user to ensure only one tab flushes at a time
+export const getFlushLockName = (userId: string): string => `remedi_flush_${userId}`;
+
+// Check if Web Locks API is available
+export const hasWebLocks = (): boolean => {
+  return typeof navigator !== 'undefined' && 'locks' in navigator;
+};
+
+// Acquire a lock and run the callback. Returns false if lock couldn't be acquired.
+// Uses ifAvailable mode: if another tab holds the lock, returns immediately with false.
+export const withFlushLock = async <T>(
+  userId: string,
+  callback: () => Promise<T>
+): Promise<{ acquired: boolean; result?: T }> => {
+  if (!hasWebLocks()) {
+    // Fallback: no locking, just run the callback
+    const result = await callback();
+    return { acquired: true, result };
+  }
+  
+  try {
+    let acquired = false;
+    let result: T | undefined;
+    
+    await navigator.locks.request(
+      getFlushLockName(userId),
+      { ifAvailable: true },
+      async (lock) => {
+        if (lock) {
+          acquired = true;
+          result = await callback();
+        }
+        // If lock is null, another tab holds it - we skip
+      }
+    );
+    
+    return { acquired, result };
+  } catch {
+    // Lock API failed - fallback to running without lock
+    const result = await callback();
+    return { acquired: true, result };
+  }
+};

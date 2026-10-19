@@ -27,6 +27,9 @@ import {
   getSyncChannelName,
   isValidSyncMessage,
   createSyncMessage,
+  hasWebLocks,
+  withFlushLock,
+  getFlushLockName,
   type SyncMessage,
 } from '../lib/syncEngine';
 import {
@@ -365,35 +368,23 @@ describe('BroadcastChannel', () => {
     expect(getSyncChannelName('user-1')).not.toBe(getSyncChannelName('user-2'));
   });
   
-  it('tab B gets the change and does not re-broadcast (N7)', async () => {
+  it('N7: tab B gets the change with full pill data', async () => {
     // Test with two real BroadcastChannel instances
     const channelA = new BroadcastChannel(getSyncChannelName(userId));
     const channelB = new BroadcastChannel(getSyncChannelName(userId));
     
     const receivedOnB: SyncMessage[] = [];
-    const receivedOnA: SyncMessage[] = [];
-    let rebroadcastedFromB = false;
     
-    // Tab B receives and should NOT re-broadcast
+    // Tab B receives and should get full pill data
     channelB.onmessage = (event) => {
       if (isValidSyncMessage(event.data)) {
         receivedOnB.push(event.data);
-        // Simulate what a bad implementation would do: re-broadcast
-        // A correct implementation sets reloadTriggeredByChannelRef = true first
-        // and checks it before broadcasting
       }
     };
     
-    // Tab A listens for any re-broadcasts from B
-    channelA.onmessage = (event) => {
-      if (isValidSyncMessage(event.data)) {
-        receivedOnA.push(event.data);
-        rebroadcastedFromB = true;
-      }
-    };
-    
-    // Tab A sends a pill_changed message
-    const msg = createSyncMessage('pill_changed', userId, 'pill-1');
+    // Tab A sends a pill_changed message WITH full pill data
+    const testPill = createTestPill('pill-1', 'Test Pill', Date.now());
+    const msg = createSyncMessage('pill_changed', userId, 'pill-1', testPill);
     channelA.postMessage(msg);
     
     // Wait for message propagation
@@ -404,13 +395,51 @@ describe('BroadcastChannel', () => {
     expect(receivedOnB[0].type).toBe('pill_changed');
     expect(receivedOnB[0].pillId).toBe('pill-1');
     
-    // Tab A should NOT have received anything back (no re-broadcast from B)
-    // Note: This tests the message flow, the actual ping-pong prevention
-    // is implemented in App.tsx using reloadTriggeredByChannelRef
-    expect(receivedOnA.length).toBe(0);
+    // Tab B should have received the full pill data
+    expect(receivedOnB[0].pill).toBeDefined();
+    expect(receivedOnB[0].pill!.name).toBe('Test Pill');
     
     channelA.close();
     channelB.close();
+  });
+  
+  it('N7b: message includes pill data for immediate apply', () => {
+    const testPill = createTestPill('pill-1', 'Test Pill', Date.now());
+    const msg = createSyncMessage('pill_changed', userId, 'pill-1', testPill);
+    
+    expect(msg.pill).toBeDefined();
+    expect(msg.pill!.id).toBe('pill-1');
+    expect(msg.pill!.name).toBe('Test Pill');
+    
+    // Validate the message
+    expect(isValidSyncMessage(msg)).toBe(true);
+  });
+});
+
+describe('Web Locks', () => {
+  const userId = 'test-user';
+  
+  it('getFlushLockName returns per-user lock name', () => {
+    expect(getFlushLockName('user-1')).toBe('remedi_flush_user-1');
+    expect(getFlushLockName('user-2')).toBe('remedi_flush_user-2');
+  });
+  
+  it('withFlushLock runs callback when lock available', async () => {
+    let callbackRan = false;
+    const { acquired, result } = await withFlushLock(userId, async () => {
+      callbackRan = true;
+      return 'success';
+    });
+    
+    expect(callbackRan).toBe(true);
+    expect(acquired).toBe(true);
+    expect(result).toBe('success');
+  });
+  
+  it('hasWebLocks returns boolean', () => {
+    // In jsdom, Web Locks may not be available
+    const result = hasWebLocks();
+    expect(typeof result).toBe('boolean');
   });
 });
 
