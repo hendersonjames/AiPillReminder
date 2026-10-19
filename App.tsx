@@ -10,7 +10,7 @@ import DoctorReport from './components/DoctorReport';
 import { ChatIcon, PlusIcon } from './components/icons/Icons';
 import { playSound } from './services/soundService';
 import { onAuthStateChange, signOut, cleanupUserData, type User } from './services/authService';
-import { loadPillsFromCloud, syncPillsToCloud } from './services/pillsService';
+import { loadPillsFromCloud } from './services/pillsService';
 import {
   requestNotificationPermission,
   fireImmediateNotification,
@@ -24,34 +24,26 @@ import {
 } from './services/notificationService';
 import {
   loadPillsFromStorage,
-  savePillsToStorage,
   loadCloudIdsFromStorage,
   saveCloudIdsToStorage,
-  getLastMissedSweepDate,
-  setLastMissedSweepDate,
-  setPendingSync,
-  hasPendingSync,
   purgeLegacyUnscopedData,
-  getDateString,
 } from './lib/storage';
 import {
+  hasUnsyncedChanges,
+  getSyncChannelName,
+  isValidSyncMessage,
+  createSyncMessage,
+} from './lib/syncEngine';
+import { useSyncEngine } from './lib/useSyncEngine';
+import {
   isReminderTakenToday,
-  recordMissedDoses,
   removeLatestTakenEntry,
   enhancePillsWithDerivedStatus,
 } from './lib/pillHelpers';
-import {
-  shouldQueueTap,
-  applyTakenMarkToPill,
-  orchestrateAfterCloudLoad,
-  type QueuedTap,
-} from './lib/loadOrchestration';
 
 // Purge legacy unscoped data at module load, BEFORE auth
 // This prevents data from old versions being shown to any user
 purgeLegacyUnscopedData();
-
-const SYNC_DEBOUNCE_MS = 1500;
 
 // ─── Web-only Notification helpers (used when not running natively) ───────────
 
@@ -152,6 +144,26 @@ const App: React.FC = () => {
 
   const handleSignOut = useCallback(async () => {
     const currentUserId = prevUserIdRef.current;
+    
+    // Check for unsynced changes before sign-out
+    if (currentUserId && hasUnsyncedChanges(currentUserId)) {
+      // Try to flush first
+      const flushCallback = flushCallbackRef.current;
+      if (flushCallback) {
+        const flushed = await flushCallback();
+        if (!flushed) {
+          // Warn user about potential data loss
+          const confirmed = window.confirm(
+            'You have unsynced changes that could not be saved. ' +
+            'If you sign out now, these changes may be lost. Continue?'
+          );
+          if (!confirmed) {
+            return;
+          }
+        }
+      }
+    }
+    
     signingOutRef.current = true;
     setSignOutError(null);
     
@@ -234,24 +246,51 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   onSignOut,
   onClearError,
 }) => {
-  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
   const [notifDismissed, setNotifDismissed] = useState(false);
+  const [idGenError, setIdGenError] = useState<string | null>(null);
   
-  // Track whether initial cloud load succeeded - NEVER sync before this
-  const cloudLoadSucceededRef = useRef(false);
-  // Track which user ID we loaded for (prevents cross-user writes)
-  const loadedForUserIdRef = useRef<string | null>(null);
-  const syncTimeoutRef = useRef<number | undefined>(undefined);
+  // Track if last reload was triggered by BroadcastChannel (prevents ping-pong)
+  const reloadTriggeredByChannelRef = useRef(false);
+  
+  // Single BroadcastChannel instance owned by this component for both send & receive
+  const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
+  
+  // Debounce timer for notification rescheduling (L-a fix)
+  const notifRescheduleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  
+  // ─── Use sync engine hook for core sync wiring ──────────────────────────────
+  const { state, actions } = useSyncEngine({
+    userId,
+    loadPillsFromCloud,
+    signingOutRef, // Pass ref directly for live reads (N8 fix)
+    onPillsChange: (newPills) => {
+      // L-a fix: debounce notification rescheduling ~500ms
+      if (isNative()) {
+        if (notifRescheduleTimerRef.current) {
+          clearTimeout(notifRescheduleTimerRef.current);
+        }
+        notifRescheduleTimerRef.current = setTimeout(() => {
+          cancelAllScheduledNotifications().then(() => {
+            scheduleAllPillNotifications(newPills);
+          });
+          notifRescheduleTimerRef.current = null;
+        }, 500);
+      }
+      // Broadcast to other tabs ONLY if not triggered by channel message
+      // Note: We send pills_loaded without pill data since storage is already written
+      if (!reloadTriggeredByChannelRef.current && broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage(createSyncMessage('pills_loaded', userId));
+      }
+      reloadTriggeredByChannelRef.current = false;
+    },
+  });
+  
+  const { pills, syncStatus } = state;
+  const { markDirty, markReminderTaken, flushSync, hasUnsynced, setPills } = actions;
+  
   const pillsRef = useRef<Pill[]>([]);
   const cloudIdsRef = useRef<Set<string>>(new Set());
-  // Notification listener handle for cleanup
   const notifListenerRef = useRef<NotificationListenerHandle | null>(null);
-  // Queue for notification taps that arrive before cloud load completes
-  const pendingNotifTapsRef = useRef<QueuedTap[]>([]);
-  // Track if missed dose sweep has run after this load
-  const missedSweepDoneRef = useRef(false);
-
-  const [pills, setPills] = useState<Pill[]>([]);
 
   // UI state - all reset per-user due to key={userId} remount
   const [isAddPillModalOpen, setAddPillModalOpen] = useState(false);
@@ -261,29 +300,13 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
 
   // Keep ref in sync
   useEffect(() => { pillsRef.current = pills; }, [pills]);
-
-  // ─── Mark taken handler (for notification taps) ─────────────────────────────
-  // If cloud load hasn't completed, queue the tap to apply after load
-  // Uses shouldQueueTap from loadOrchestration for testability
-  const markReminderTaken = useCallback((pillId: string, reminderId: string) => {
-    if (shouldQueueTap(cloudLoadSucceededRef.current)) {
-      pendingNotifTapsRef.current.push({ pillId, reminderId, userId });
-      return;
-    }
-    
-    applyTakenMark(pillId, reminderId);
-  }, [userId]);
   
-  // Apply taken mark to pills state (used directly and for queued taps)
-  // Uses applyTakenMarkToPill from loadOrchestration for testability
-  const applyTakenMark = useCallback((pillId: string, reminderId: string) => {
-    setPills(prevPills => prevPills.map(pill => {
-      if (pill.id === pillId) {
-        return applyTakenMarkToPill(pill, reminderId);
-      }
-      return pill;
-    }));
-  }, []);
+  // Update cloud IDs when pills change
+  useEffect(() => {
+    const newCloudIds = new Set<string>(pills.filter(p => !p.deleted).map(p => p.id));
+    cloudIdsRef.current = newCloudIds;
+    saveCloudIdsToStorage(userId, newCloudIds);
+  }, [pills, userId]);
 
   // ─── Register notification listener inside SignedInApp (B2 fix) ─────────────
   useEffect(() => {
@@ -295,7 +318,6 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
     setupListener();
     
     return () => {
-      // Clean up listener on unmount (sign-out or user change)
       if (notifListenerRef.current) {
         notifListenerRef.current.remove();
         notifListenerRef.current = null;
@@ -303,33 +325,58 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
     };
   }, [markReminderTaken]);
 
-  // ─── Flush pending sync (for visibilitychange/pagehide AND sign-out) ────────
-  const flushPendingSync = useCallback(async () => {
-    // Allow flush during sign-out (we WANT to save before clearing)
-    // But don't flush if not for this user
-    if (!cloudLoadSucceededRef.current) return;
-    if (loadedForUserIdRef.current !== userId) return;
+  // ─── Multi-tab coordination via BroadcastChannel ────────────────────────────
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return;
     
-    // Cancel any pending debounced sync
-    if (syncTimeoutRef.current) {
-      clearTimeout(syncTimeoutRef.current);
-      syncTimeoutRef.current = undefined;
-    }
+    const channel = new BroadcastChannel(getSyncChannelName(userId));
+    broadcastChannelRef.current = channel;
     
-    // Check if there's actually pending changes
-    if (!hasPendingSync(userId)) return;
-    
-    try {
-      const result = await syncPillsToCloud(userId, pillsRef.current, cloudIdsRef.current);
-      if (result.success) {
-        saveCloudIdsToStorage(userId, new Set(pillsRef.current.map(p => p.id)));
-        cloudIdsRef.current = new Set(pillsRef.current.map(p => p.id));
-        setPendingSync(userId, false);
+    channel.onmessage = (event) => {
+      // Validate message shape
+      if (!isValidSyncMessage(event.data)) return;
+      const msg = event.data;
+      if (msg.userId !== userId) return;
+      
+      if (msg.type === 'pill_changed' && msg.pillId) {
+        // Set ping-pong flag BEFORE setPills to prevent re-broadcast
+        reloadTriggeredByChannelRef.current = true;
+        // Use pill from message if available (avoids race with storage)
+        if (msg.pill) {
+          setPills(prevPills => {
+            const exists = prevPills.some(p => p.id === msg.pillId);
+            if (exists) {
+              return prevPills.map(p => p.id === msg.pillId ? msg.pill! : p);
+            } else {
+              return [...prevPills, msg.pill!];
+            }
+          });
+        } else {
+          // Fallback to storage read
+          const refreshedPills = loadPillsFromStorage(userId);
+          setPills(enhancePillsWithDerivedStatus(refreshedPills));
+        }
+      } else if (msg.type === 'pill_deleted' && msg.pillId) {
+        reloadTriggeredByChannelRef.current = true;
+        setPills(prevPills => prevPills.filter(p => p.id !== msg.pillId));
+      } else if (msg.type === 'pills_loaded') {
+        reloadTriggeredByChannelRef.current = true;
+        const refreshedPills = loadPillsFromStorage(userId);
+        setPills(enhancePillsWithDerivedStatus(refreshedPills));
       }
-    } catch (err) {
-      console.error('Flush sync failed:', err);
-    }
-  }, [userId]);
+    };
+    
+    return () => {
+      broadcastChannelRef.current = null;
+      channel.close();
+    };
+  }, [userId, setPills]);
+
+  // ─── Flush pending sync wrapper for sign-out ────────────────────────────────
+  const flushPendingSync = useCallback(async (): Promise<boolean> => {
+    const result = await flushSync();
+    return result.success;
+  }, [flushSync]);
 
   // Register flush callback for sign-out to use
   useEffect(() => {
@@ -338,155 +385,6 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       flushCallbackRef.current = null;
     };
   }, [flushPendingSync, flushCallbackRef]);
-
-  // ─── Load from cloud on mount ───────────────────────────────────────────────
-  useEffect(() => {
-    const loadCloud = async () => {
-      // Reset load state
-      cloudLoadSucceededRef.current = false;
-      loadedForUserIdRef.current = null;
-      missedSweepDoneRef.current = false;
-      pendingNotifTapsRef.current = [];
-      
-      // Load from local storage for this user (immediate UI)
-      const localPills = loadPillsFromStorage(userId);
-      if (localPills.length > 0) {
-        setPills(enhancePillsWithDerivedStatus(localPills));
-      }
-      
-      // Load cloud IDs from storage
-      cloudIdsRef.current = loadCloudIdsFromStorage(userId);
-      
-      try {
-        setSyncStatus('syncing');
-        const cloudPills = await loadPillsFromCloud();
-        
-        // Cloud load succeeded - mark this BEFORE any sync can happen
-        cloudLoadSucceededRef.current = true;
-        loadedForUserIdRef.current = userId;
-        
-        // Update cloud IDs tracking
-        const newCloudIds = new Set<string>(cloudPills.map(p => p.id));
-        cloudIdsRef.current = newCloudIds;
-        saveCloudIdsToStorage(userId, newCloudIds);
-        
-        // Run orchestration: sweep + apply queued taps
-        // Uses orchestrateAfterCloudLoad from loadOrchestration for testability
-        const lastSweep = getLastMissedSweepDate(userId);
-        const yesterday = new Date();
-        yesterday.setDate(yesterday.getDate() - 1);
-        const yesterdayStr = getDateString(yesterday);
-        
-        const orchestrationResult = orchestrateAfterCloudLoad(
-          cloudPills,
-          lastSweep,
-          yesterdayStr,
-          pendingNotifTapsRef.current,
-          userId,
-          recordMissedDoses
-        );
-        pendingNotifTapsRef.current = [];
-        
-        if (orchestrationResult.sweepRan) {
-          setLastMissedSweepDate(userId, yesterdayStr);
-        }
-        missedSweepDoneRef.current = true;
-        
-        // Use orchestrated pills, enhanced with derived taken status
-        const enhancedPills = enhancePillsWithDerivedStatus(orchestrationResult.pills);
-        setPills(enhancedPills);
-        savePillsToStorage(userId, enhancedPills);
-        
-        // Cancel any existing native notifications and reschedule from cloud data
-        // This ensures notifications match the user's actual pills
-        if (isNative()) {
-          await cancelAllScheduledNotifications();
-          await scheduleAllPillNotifications(orchestrationResult.pills);
-        }
-        
-        setSyncStatus('synced');
-        
-        // Clear any stale pending sync flag
-        setPendingSync(userId, false);
-      } catch (err) {
-        console.error('Failed to load from cloud:', err);
-        setSyncStatus('error');
-        // DO NOT set cloudLoadSucceededRef.current = true here
-        // This prevents destructive sync when load fails
-        
-        // On load failure, apply queued taps to local state so user's action isn't lost
-        // They'll be in localStorage and can sync when connection is restored
-        // Uses applyQueuedTapsToPills from loadOrchestration for testability
-        const { filterTapsForUser, applyQueuedTapsToPills } = await import('./lib/loadOrchestration');
-        const tapsForUser = filterTapsForUser(pendingNotifTapsRef.current, userId);
-        pendingNotifTapsRef.current = [];
-        if (tapsForUser.length > 0) {
-          setPills(prevPills => applyQueuedTapsToPills(prevPills, tapsForUser));
-        }
-      }
-    };
-    
-    loadCloud();
-  }, [userId, applyTakenMark]); // Only depends on userId, not user object (S6)
-
-  // ─── Persist to localStorage (user-scoped) ──────────────────────────────────
-  useEffect(() => {
-    // Block writes during sign-out or if we haven't loaded for this user
-    if (signingOutRef.current) return;
-    if (loadedForUserIdRef.current !== userId) return;
-    
-    savePillsToStorage(userId, pills);
-  }, [pills, userId]);
-
-  // ─── Debounced cloud sync (only after successful load) ──────────────────────
-  useEffect(() => {
-    // Block sync during sign-out or before load succeeds
-    if (signingOutRef.current) return;
-    if (!cloudLoadSucceededRef.current) return;
-    if (loadedForUserIdRef.current !== userId) return;
-    
-    // Mark that there's a pending sync
-    setPendingSync(userId, true);
-    
-    if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
-    setSyncStatus('idle');
-    
-    syncTimeoutRef.current = window.setTimeout(async () => {
-      // Double-check we should still sync
-      if (signingOutRef.current) return;
-      if (loadedForUserIdRef.current !== userId) return;
-      
-      try {
-        setSyncStatus('syncing');
-        const result = await syncPillsToCloud(userId, pills, cloudIdsRef.current);
-        
-        if (result.aborted) {
-          // User changed during sync - don't update state
-          console.warn('Sync aborted:', result.error);
-          setSyncStatus('error');
-          return;
-        }
-        
-        if (result.success) {
-          const newCloudIds = new Set<string>(pills.map(p => p.id));
-          cloudIdsRef.current = newCloudIds;
-          saveCloudIdsToStorage(userId, newCloudIds);
-          setPendingSync(userId, false);
-          setSyncStatus('synced');
-        } else {
-          console.error('Cloud sync failed:', result.error);
-          setSyncStatus('error');
-        }
-      } catch (err) {
-        console.error('Cloud sync failed:', err);
-        setSyncStatus('error');
-      }
-    }, SYNC_DEBOUNCE_MS);
-    
-    return () => {
-      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
-    };
-  }, [pills, userId]);
 
   // ─── Flush sync on tab close/hide ───────────────────────────────────────────
   useEffect(() => {
@@ -509,7 +407,7 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('pagehide', handlePageHide);
     };
-  }, [flushPendingSync]);
+  }, [flushPendingSync, signingOutRef]);
 
   // ─── Snooze expiry check (every 30s) — re-triggers alarm when snooze ends ───
   // Compute due alarms from ref OUTSIDE the updater, then do state update
@@ -634,7 +532,15 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
         };
       });
       
+      // Mark as dirty for offline support
+      savedPill = markDirty(savedPill, 'upsert');
+      
       setPills(prevPills => prevPills.map(p => (p.id === savedPill.id ? savedPill : p)));
+      
+      // L-c fix: Broadcast AFTER save with full pill data (one message per change)
+      if (broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, savedPill.id, savedPill));
+      }
       
       // Cancel old notifications and reschedule
       if (isNative()) {
@@ -649,12 +555,40 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
       }
     } else {
       const now = Date.now();
-      savedPill = { ...pillData, id: now.toString(), history: [], createdAt: now };
+      // Use crypto.randomUUID() with crypto.getRandomValues fallback
+      let newId: string;
+      try {
+        if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+          newId = crypto.randomUUID();
+        } else if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+          const bytes = new Uint8Array(16);
+          crypto.getRandomValues(bytes);
+          bytes[6] = (bytes[6] & 0x0f) | 0x40; // Version 4
+          bytes[8] = (bytes[8] & 0x3f) | 0x80; // Variant 10
+          const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+          newId = `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+        } else {
+          throw new Error('crypto.randomUUID or crypto.getRandomValues required for pill ID generation');
+        }
+      } catch (err) {
+        setIdGenError(err instanceof Error ? err.message : 'Failed to generate pill ID');
+        return;
+      }
+      savedPill = { ...pillData, id: newId, history: [], createdAt: now };
       savedPill.reminders = savedPill.reminders.map(r => ({
         ...r,
         taken: false,
       }));
+      
+      // Mark as dirty for offline support
+      savedPill = markDirty(savedPill, 'upsert');
+      
       setPills(prevPills => [...prevPills, savedPill]);
+      
+      // L-c fix: Broadcast AFTER save with full pill data (one message per change)
+      if (broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, savedPill.id, savedPill));
+      }
       
       // Schedule notifications for new pill
       if (isNative()) {
@@ -668,6 +602,7 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
     }
     setAddPillModalOpen(false);
     setPillToEdit(undefined);
+    setIdGenError(null);
   };
 
   const openAddModal = () => { setPillToEdit(undefined); setAddPillModalOpen(true); };
@@ -675,87 +610,121 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
   const closeModal = () => { setAddPillModalOpen(false); setPillToEdit(undefined); };
 
   // Toggle taken (for UI - allows un-marking)
+  // N4 fix: markDirty and broadcast moved OUTSIDE the setPills updater
   const toggleReminderTaken = useCallback((pillId: string, reminderId: string) => {
-    setPills(prevPills => prevPills.map(pill => {
-      if (pill.id === pillId) {
-        const history = pill.history || [];
-        const currentlyTaken = isReminderTakenToday(history, reminderId);
-        const reminder = pill.reminders.find(r => r.id === reminderId);
-        
-        if (!reminder) return pill;
-        
-        if (currentlyTaken) {
-          const updatedHistory = removeLatestTakenEntry(history, reminderId);
-          return {
-            ...pill,
-            reminders: pill.reminders.map(r =>
-              r.id === reminderId ? { ...r, taken: false } : r
-            ),
-            history: updatedHistory,
-          };
-        } else {
-          const newHistoryEntry: HistoryEntry = {
-            id: `${Date.now()}-${reminderId}`,
-            reminderId: reminderId,
-            pillName: pill.name,
-            time: reminder.time,
-            action: 'taken',
-            timestamp: Date.now(),
-          };
-          
-          const updatedReminders = pill.reminders.map(r =>
-            r.id === reminderId ? { ...r, snoozedUntil: undefined, taken: true } : r
-          );
-          
-          return {
-            ...pill,
-            reminders: updatedReminders,
-            history: [...history, newHistoryEntry],
-          };
-        }
-      }
-      return pill;
-    }));
-  }, []);
+    // First, compute the update using current state from ref
+    const currentPill = pillsRef.current.find(p => p.id === pillId);
+    if (!currentPill) return;
+    
+    const history = currentPill.history || [];
+    const currentlyTaken = isReminderTakenToday(history, reminderId);
+    const reminder = currentPill.reminders.find(r => r.id === reminderId);
+    if (!reminder) return;
+    
+    let updatedPill: Pill;
+    if (currentlyTaken) {
+      const updatedHistory = removeLatestTakenEntry(history, reminderId);
+      updatedPill = {
+        ...currentPill,
+        reminders: currentPill.reminders.map(r =>
+          r.id === reminderId ? { ...r, taken: false } : r
+        ),
+        history: updatedHistory,
+      };
+    } else {
+      const newHistoryEntry: HistoryEntry = {
+        id: `${Date.now()}-${reminderId}`,
+        reminderId: reminderId,
+        pillName: currentPill.name,
+        time: reminder.time,
+        action: 'taken',
+        timestamp: Date.now(),
+      };
+      
+      const updatedReminders = currentPill.reminders.map(r =>
+        r.id === reminderId ? { ...r, snoozedUntil: undefined, taken: true } : r
+      );
+      
+      updatedPill = {
+        ...currentPill,
+        reminders: updatedReminders,
+        history: [...history, newHistoryEntry],
+      };
+    }
+    
+    // Mark as dirty OUTSIDE the updater
+    const dirtyPill = markDirty(updatedPill, 'upsert');
+    
+    // Update state
+    setPills(prevPills => prevPills.map(p => p.id === pillId ? dirtyPill : p));
+    
+    // L-c fix: Broadcast AFTER save with full pill data (one message per change)
+    if (broadcastChannelRef.current) {
+      broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, pillId, dirtyPill));
+    }
+  }, [userId, markDirty, setPills]);
 
+  // N4 fix: markDirty and broadcast moved OUTSIDE the setPills updater
   const snoozeReminder = useCallback((pillId: string, reminderId: string, duration: number) => {
-    setPills(prevPills => prevPills.map(pill => {
-      if (pill.id === pillId) {
-        const reminder = pill.reminders.find(r => r.id === reminderId);
-        if (!reminder) return pill;
-        
-        const newHistoryEntry: HistoryEntry = {
-          id: `${Date.now()}-${reminderId}`,
-          reminderId: reminder.id,
-          pillName: pill.name,
-          time: reminder.time,
-          action: 'snoozed',
-          timestamp: Date.now(),
-        };
-        
-        const updatedReminders = pill.reminders.map(r =>
-          r.id === reminderId
-            ? { ...r, snoozedUntil: Date.now() + duration, taken: false }
-            : r
-        );
-        
-        return {
-          ...pill,
-          reminders: updatedReminders,
-          history: [...(pill.history || []), newHistoryEntry],
-        };
-      }
-      return pill;
-    }));
-  }, []);
+    // Compute the update using current state from ref
+    const currentPill = pillsRef.current.find(p => p.id === pillId);
+    if (!currentPill) return;
+    
+    const reminder = currentPill.reminders.find(r => r.id === reminderId);
+    if (!reminder) return;
+    
+    const newHistoryEntry: HistoryEntry = {
+      id: `${Date.now()}-${reminderId}`,
+      reminderId: reminder.id,
+      pillName: currentPill.name,
+      time: reminder.time,
+      action: 'snoozed',
+      timestamp: Date.now(),
+    };
+    
+    const updatedReminders = currentPill.reminders.map(r =>
+      r.id === reminderId
+        ? { ...r, snoozedUntil: Date.now() + duration, taken: false }
+        : r
+    );
+    
+    const updatedPill: Pill = {
+      ...currentPill,
+      reminders: updatedReminders,
+      history: [...(currentPill.history || []), newHistoryEntry],
+    };
+    
+    // Mark as dirty OUTSIDE the updater
+    const dirtyPill = markDirty(updatedPill, 'upsert');
+    
+    // Update state
+    setPills(prevPills => prevPills.map(p => p.id === pillId ? dirtyPill : p));
+    
+    // L-c fix: Broadcast AFTER save with full pill data (one message per change)
+    if (broadcastChannelRef.current) {
+      broadcastChannelRef.current.postMessage(createSyncMessage('pill_changed', userId, pillId, dirtyPill));
+    }
+  }, [userId, markDirty, setPills]);
 
   const deletePill = useCallback(async (pillId: string) => {
     const pill = pillsRef.current.find(p => p.id === pillId);
-    if (pill && isNative()) {
+    if (!pill) return;
+    
+    if (isNative()) {
       await cancelAllPillNotifications(pill.id, pill.reminders);
     }
-    setPills(prevPills => prevPills.filter(pill => pill.id !== pillId));
-  }, []);
+    
+    // Mark as deleted in outbox (tombstone) for explicit cloud delete
+    markDirty(pill, 'delete');
+    
+    // Broadcast delete to other tabs
+    if (broadcastChannelRef.current) {
+      broadcastChannelRef.current.postMessage(createSyncMessage('pill_deleted', userId, pillId));
+    }
+    
+    // Remove from local state
+    setPills(prevPills => prevPills.filter(p => p.id !== pillId));
+  }, [userId, markDirty, setPills]);
 
   // ─── Derive taken status for display ────────────────────────────────────────
   const displayPills = enhancePillsWithDerivedStatus(pills);
@@ -770,6 +739,14 @@ const SignedInApp: React.FC<SignedInAppProps> = ({
           <div className="mb-3 p-3 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-800 flex items-start justify-between gap-2">
             <span>{signOutError}</span>
             <button onClick={onClearError} className="text-amber-400 hover:text-amber-600 flex-shrink-0">✕</button>
+          </div>
+        )}
+        
+        {/* ID generation error banner */}
+        {idGenError && (
+          <div className="mb-3 p-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-800 flex items-start justify-between gap-2">
+            <span>Failed to create pill: {idGenError}</span>
+            <button onClick={() => setIdGenError(null)} className="text-red-400 hover:text-red-600 flex-shrink-0">✕</button>
           </div>
         )}
 

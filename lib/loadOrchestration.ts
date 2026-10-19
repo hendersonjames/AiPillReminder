@@ -125,6 +125,8 @@ export interface LoadOrchestrationResult {
   pills: Pill[];
   sweepRan: boolean;
   tapsApplied: number;
+  /** IDs of pills that were modified by sweep or taps and need to be marked dirty */
+  changedPillIds: Set<string>;
 }
 
 export const orchestrateAfterCloudLoad = (
@@ -135,6 +137,8 @@ export const orchestrateAfterCloudLoad = (
   userId: string,
   runSweep: (pills: Pill[], lastSweep: string | null) => { updatedPills: Pill[]; hasChanges: boolean }
 ): LoadOrchestrationResult => {
+  const changedPillIds = new Set<string>();
+  
   // 1. Run sweep if needed
   let pillsAfterSweep = cloudPills;
   let sweepRan = false;
@@ -143,6 +147,12 @@ export const orchestrateAfterCloudLoad = (
   if (sweepDecision.shouldSweep) {
     const { updatedPills, hasChanges } = runSweep(cloudPills, lastSweepDateStr);
     if (hasChanges) {
+      // Track which pills were changed by the sweep
+      for (let i = 0; i < cloudPills.length; i++) {
+        if (updatedPills[i] !== cloudPills[i]) {
+          changedPillIds.add(updatedPills[i].id);
+        }
+      }
       pillsAfterSweep = updatedPills;
     }
     sweepRan = true;
@@ -150,11 +160,20 @@ export const orchestrateAfterCloudLoad = (
   
   // 2. Filter and apply queued taps
   const tapsForUser = filterTapsForUser(queuedTaps, userId);
+  
+  // Track which pills will have taps applied
+  tapsForUser.forEach(tap => {
+    if (pillsAfterSweep.some(p => p.id === tap.pillId)) {
+      changedPillIds.add(tap.pillId);
+    }
+  });
+  
   const finalPills = applyQueuedTapsToPills(pillsAfterSweep, tapsForUser);
   
   return {
     pills: finalPills,
     sweepRan,
     tapsApplied: tapsForUser.length,
+    changedPillIds,
   };
 };
